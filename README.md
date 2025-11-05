@@ -1,2 +1,2 @@
-# C-peptide-model
+# C-peptide-model_YeunYi
 Logistic regression modelling to prediction C-peptide level in insulin-treated type 2 diabetes using accessible clinical features.
