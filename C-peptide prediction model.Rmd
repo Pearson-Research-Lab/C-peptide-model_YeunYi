@@ -1,0 +1,4472 @@
+---
+title: "C-peptide prediction model- development and internal validation"
+author: YeunYi, Lin (email: ylin002@dundee.ac.uk)
+output: html_notebook
+---
+```{r}
+
+```
+
+```{r}
+### packages used for data cleaning and analysis
+```
+```{r}
+library('odbc')
+library('dplyr')
+library('dbplyr')
+library('ggplot2')
+library('tidyverse')
+library('sjPlot')
+library('olsrr') ### collinearity
+library('pROC') ### AUC, ROC
+library ('caret') ### splitting dataset 
+library('car')
+library ('MLmetrics') ### additional performance metrics for KFCV and bootstrapping
+library('mfp') ### multifractional polynomial
+library('GGally') ### correlation matrix
+library('corrplot') ### correlation matrix
+library('broom') ### odds ratio
+library('finalfit') ### odds ratio
+library('compareGroups') ### baseline characteristics descriptive table
+```
+######################################################################################################
+```{r}
+######### IMPORTING DATASET ######### 
+### STUDY POPULATION: participants from GoFusion (Tayside and Fife, Scotland) ###
+### approval for access from SHARE Scotland ###
+### access to dataset and analysis within Trusted Research Envinroment provided by Health Informatics Centre (HIC), University of Dundee ###
+
+### Proceed to Row 109 if not using GoFusion population
+```
+
+```{r}
+### GoFusion is a biorepository - combination of two cohorts (GoSHARE and GoDARTS)
+### 
+### GoSHARE and GoDARTS datasets were individually provided by HIC so these datasets had to be merged
+```
+
+```{r}
+### importing dataset from SQL server
+```
+```{r}
+cpep_GD <- DBI::dbReadTable(conn, "Cpeptides_GD")
+cpep_GS <- DBI::dbReadTable(conn, "Cpeptides_GS")
+```
+```{r}
+### create subsets from datasets
+```
+```{r}
+cpep_GD_subset <- cpep_GD[,c("PROCHI", "cpeptide_date1", "cpep1")]
+cpep_GS_subset <- cpep_GS[,c("PROCHI", "date", "cpep")]
+
+### deduplicate data within the datasets
+GD_ids <- cpep_GD_subset$PROCHI # PROCHI is an individual's unique id in the dataset
+GS_ids <- cpep_GS_subset$PROCHI
+
+length(GD_ids) ### 8205
+length(unique(GD_ids)) ### 8205
+
+length(GS_ids) ### 1151
+length(unique(GS_ids)) ### 1151
+
+### identify any duplicate data when merging two datasets
+length(intersect(GD_ids, GS_ids))  ### 1
+intersect(GD_ids, GS_ids) 
+
+### exclude the duplicate from cpep_GS_subset
+cpep_GS_subset2 <- subset(cpep_GS_subset, PROCHI != "enterID")
+dim(cpep_GS_subset2) ###1150
+
+### make column names the same between cpep_GD_subset and cpep_GS_subset2
+colnames(cpep_GS_subset2) <- c("PROCHI", "cpeptide_date1", "cpep1")
+
+### ensure that date is in the same format
+cpep_GS_subset2$cpeptide_date1 <- as.Date(cpep_GS_subset2$cpeptide_date1)
+cpep_GD_subset$cpeptide_date1 <- as.Date(cpep_GD_subset$cpeptide_date1)
+
+### create an extra column to inform the source of each row for future reference
+cpep_GD_subset$Group <- "GD"
+cpep_GS_subset2$Group <- "GS"
+
+### merge cpep_GD_subset and cpep_GS_subset2
+merged_GD_GS <- rbind(cpep_GD_subset, cpep_GS_subset2)
+dim(merged_GD_GS) ###9355
+
+### convert cpep1 from nmol/L to pmol/L
+merged_GD_GS$cpep_pmol <- merged_GD_GS$cpep1*1000
+
+### some missing cpeptide_date1 from cpep_GS_subset2 
+###create another merged dataframe without the missing values
+merged_GD_GS2 <- merged_GD_GS %>% filter (!is.na(cpeptide_date1))
+dim(merged_GD_GS2) ###9348 individuals with any diabetes diagnosis who have C-peptide measured
+```
+```{r}
+### NOTE:  merged_GD_GS2 will be renamed as cpep_df from here onwards
+```
+######################################################################################################
+######################################################################################################
+```{r}
+### DATAFRAME NAME: cpep_df
+### individuals with clinical diagnosis of diabetes and with C-peptide measurements
+### C-peptide unit: pmol/L
+```
+
+```{r}
+### Individuals with INSULIN PRESCRIPTION 
+```
+```{r}
+patient_ids <- cpep_df$PROCHI
+
+### Retrieve prescribing data from SQL server
+### limiting prescribing date until 31-12-2018 
+### Writing and running query to extract from SQL server
+query <- Prescribing %>% filter(PROCHI %in% patient_ids, corrected_PRESCRIBED_DATE < '2019-01-01' )
+prescribing_raw <- query %>% collect()
+prescribing_raw<- as.data.frame(prescribing_raw)
+dim(prescribing_raw) 
+
+prescribing1 <- prescribing_raw[,c("PROCHI","corrected_PRESCRIBED_DATE","quantity","directions","no_of_packs","res_seqno")]
+dim(prescribing1) ### 9128383
+length(unique(prescribing1$PROCHI))
+###  9277 unique individuals with prescribing data (ALL drugs)
+
+### convert date format
+prescribing1$corrected_PRESCRIBED_DATE <- as.Date(prescribing1$corrected_PRESCRIBED_DATE)
+
+### identify INSULIN PRESCRIPTION ONLY
+### import "Prescribing items" from SQL server - this contains the unique code for each drug
+prescribing_items <- DBI::dbReadTable(conn, "Prescribing_Prescribing_Items")
+prescribing_items1 <- prescribing_items [,c("res_seqno","Name","formatted_BNF_Code","Approved_Name")]
+
+###extract res_seqno of insulin based on BNF code 6.1.1.1 AND 6.1.1.2; AND additional one with Xultophy prescription (res_seqno 738983)
+insulin <- prescribing_items1[ c(prescribing_items1$formatted_BNF_Code %in% c("6.1.1.1", "6.1.1.2") | PrescribingItems$res_seqno ==  738983), ]
+### 'insulin' is dataframe of codes for all types of insulin 
+dim(insulin) ### 203 res_seqno
+
+### filter individuals in cpep_df dataframe who is on insulin 
+oninsulin <- merge(prescribing1, insulin, by = 'res_seqno')
+dim(oninsulin) ### 278520
+length(unique(oninsulin$PROCHI)) ###3304 individuals with insulin prescription (at any timepoint up until 31/12/2018)
+
+oninsulin1 <- oninsulin [,c("PROCHI","corrected_PRESCRIBED_DATE","OnInsulin")]
+oninsulin1 $corrected_PRESCRIBED_DATE <- as.Date(oninsulin1 $corrected_PRESCRIBED_DATE)
+
+### use loop function to get closest insulin prescription date to C-peptide date for each individual 
+### Decision 1 = individuals who have closest insulin prescription within 365 days before or after C-peptide measurement
+### Decision 0 = individuals whose closest insulin prescription >365 days before or after C-peptide measurement
+insulinloop<- list()
+pt_ids <- unique(oninsulin1$PROCHI)
+for (i in 1:length(pt_ids)){
+  print(i)
+  temp_id <- pt_ids[i]
+  temp_df2 <- subset(oninsulin1 , PROCHI == temp_id)
+  temp_df2 <- temp_df2[order(temp_df2$corrected_PRESCRIBED_DATE),]
+  temp_df2$Cpep_Date <- cpep_df$cpeptide_date1[match(temp_df2$PROCHI, cpep_df$PROCHI)]
+  ## vector of prescription dates
+  insulindate <- temp_df2$corrected_PRESCRIBED_DATE
+  t1 <- abs (as.numeric(temp_df2$Cpep_Date - insulindate))
+  min (t1)
+  
+  if(min(t1) <366){
+    temp_df2$Decision <- 1
+  }else{
+    temp_df2$Decision <- 0
+  }
+
+  temp_df2.list <- list(temp_df2)
+  insulinloop<- append(insulinloop, temp_df2.list)
+}
+  oninsulin2 <- do.call(rbind, insulinloop)
+dim(oninsulin2) ###278467
+length(unique(oninsulin2)) ###3303
+
+### identify any duplicates
+oninsulin3<- oninsulin2[!duplicated(oninsulin2$PROCHI),]
+dim(oninsulin3) ###3303 
+### no duplicates
+
+### subset individuals who have insulin prescription within 12 months before or after C-peptide measurement
+### Decision = 1
+oninsulin4 <- oninsulin3 %>%
+  filter(Decision == 1)
+dim(oninsulin4) ###1697 individuals have insulin prescription within 12 months before or after C-peptide testing 
+
+### from 'oninsulin4' dataframe, use loop funrction identify individuals with insulin prescription who are on longterm insulin (more than 180 days before AND after C peptide measurement)
+
+longtermloop <- list()
+pt_ids <- unique(oninsulin4$PROCHI)
+for (i in 1:length(pt_ids)){
+  print(i)
+  temp_id <- pt_ids[i]
+  temp_df <- subset(oninsulin4, PROCHI == temp_id)
+  temp_df <- temp_df[order(temp_df$corrected_PRESCRIBED_DATE),]
+  temp_df$Cpep_Date <- cpep_df$cpeptide_date1[match(temp_df$PROCHI, cpep_df$PROCHI)]
+  ## vector of prescription dates
+  InsulinDate <- temp_df$corrected_PRESCRIBED_DATE
+  t1 <- as.numeric(temp_df$Cpep_Date[1] - min(InsulinDate)) 
+  if(t1 > 180){
+   temp_df$Decision <- 1
+  }else{
+  temp_df$Decision <- 0
+  }
+  temp_df.list <- list(temp_df)
+  longtermloop <- append(longtermloop, temp_df.list)
+}
+oninsulin5 <- do.call(rbind, longtermloop)
+dim(oninsulin5) ### 208796
+oninsulin6<- oninsulin5[!duplicated(oninsulin5$PROCHI),]
+dim(oninsulin6) ###1697 
+
+### then create subset of individuals on long term insulin i.e. person is on insulin >180 days before and after C-peptide tested
+### Decision = 1
+oninsulin7 <- oninsulin6 %>%
+  filter(Decision == 1)
+dim(oninsulin7 ) ###1397 individuals with C-peptide measurement & meeting insulin criteria
+```
+
+```{r}
+### include individuals with CLINICAL DIAGNOSIS OF TYPE 2 DIABETES
+```
+```{r}
+diabdxraw <- tbl(conn, "Diabetes_Diagnosis") ### connect to SQL server
+### import diagnosis data for PROCHI with C-peptide & on insulin only
+patient_ids <- oninsulin7$PROCHI
+length(patient_ids) ### 1397
+query <- diabdxraw %>% filter(PROCHI %in% patient_ids )
+diabdx_raw <- query %>% collect()
+dim(diabdx_raw) ### 1405 ### this means there are duplicated diagnosis data
+
+### dataframe with PROCHI, DiabetesMellitusType, Date_of_Diagnosis columns
+diabdx <- diabdx_raw[,c("PROCHI","DiabetesMellitusType", "Date_of_Diagnosis")]
+
+## do all individuals with c-peptide & on insulin have a diagnosis label?
+ids_cpep <- InclusionList_Insulin$PROCHI
+ids_diabdx <- DiabDx$PROCHI
+length(intersect(ids_cpep, ids_diabdx)) ### 1397  
+### all PROCHI has a diagnosis 
+
+### merge oninsulin7 and diabdx dataframes
+
+diabdx2 <- merge(oninsulin7, diabdx, by = 'PROCHI')
+dim(diabdx2) ###  1405 ### duplicates still present
+
+diabdx2 %>% select (DiabetesMellitusType) %>%
+  filter(!complete.cases(.))  ### filter missing data for DiabetesMellitusType
+
+### select only Type 2 Diabetes (coded as "DD-DMT-02")
+
+diabdx3 <- subset(diabdx2, DiabetesMellitusType %in% c("DD-DMT-02"))
+dim(diabdx3) ### 1276 with diagnosis of T2D ONLY and on insulin 
+
+diabdx3[duplicated(diabdx3$PROCHI),] ### identify the duplicates
+
+diabdx4<- diabdx3[!duplicated(diabdx3$PROCHI),] ###Remove duplicates 
+length(unique(diabdx4$PROCHI)) ###1269 individuals with T2D, on longterm insulin around C-peptide measurement
+```
+
+```{r}
+### exclude ANTI-GAD>=11
+```
+```{r}
+###import antiGAD data 
+gads <- tbl (conn, 'GD_GADS') ### connect to SQL server
+patient_ids <- diabdx4$PROCHI
+ query <- gads%>% filter(PROCHI %in% patient_ids)
+gad_raw <- query %>% collect ()
+length(unique(gad_raw $PROCHI)) ###507 with anti-GAD result
+
+### remove PROCHI with positive anti-GAD (>=11)
+gad1 <- subset (gad_raw, !gads < 11)
+dim (gad1) ### 59 PROCHI with GADS >=11
+min (gad1$gads) ### 11.213
+pt_gads <- gad1$PROCHI
+
+diabdx5 <- subset (diabdx4, !PROCHI %in% pt_gads)
+dim(diabdx5) ###1210 individuals with T2D (excluded positive antiGADs), on longterm insulin around C-peptide measurement
+```
+
+```{r}
+### exclude anyone WITH AGE<35 
+```
+```{r}
+### merge dataframes diabdx5 and cpep_df
+main <- merge(diabdx5, cpep_df, by = 'PROCHI')
+dim(main) ###1210
+
+###import Demography data from SQL server
+patient_ids <- main$PROCHI
+Demography_Current <- tbl(conn, "Demography_Current")
+query <- Demography_Current %>% filter(PROCHI %in% patient_ids)
+demo_raw <- query %>% collect ()
+dim(demo_raw) #### 1210
+
+### create dataframe with ("PROCHI"  ,  "sex"  , "Calculated_Age", "anon_date_of_birth" ) columns
+demo1 <- demo_raw[,c("PROCHI"  ,  "sex"  , "Calculated_Age" , "HBSIMD5" ,  "SCSIMD5" , "anon_date_of_birth" )]
+### rename "Calculated_Age" and "anon_date_of_birth" columns
+demo1 <- demo1 %>%
+  rename(Age = Calculated_Age) %>%
+  rename (DOB = anon_date_of_birth)
+dim(demo1) ### 1210
+
+demo1 %>% select (sex, Age, DOB) %>%
+  filter(!complete.cases(.)) ### check for any missing data
+
+### merge demo1 & main dataframes
+ main1 <- merge (demo1, main, by = 'PROCHI')
+dim(main1) ###1210 
+
+### Calculate Age when C-peptide test is taken
+ main1$DOB <- as.Date(main1$DOB)
+ main1$Cpep_Date <- as.Date(main1$Cpep_Date)
+ main1 <- main1 %>%
+   mutate (AgeCpep = as.numeric(difftime(Cpep_Date, DOB, units = "days")) /365.25)
+ main1$AgeCpep <- ceiling (main1$AgeCpep ) ## ceiling function round up numbers to nearest integer that is greater than or equal to
+
+main2 <- subset (main1, !AgeCpep < 35) #exclude age<35
+dim(main2) ### 1203 INDIVIDUALS AGED >=35 ###
+```
+
+```{r}
+### NEW COLUMN: C-peptide HIGH (600 or above) or LOW (below 600)
+Cpepcutoff <-599
+main2$Cpep600 <- cut(main2$cpep_pmol,
+                                breaks = c(-Inf, Cpepcutoff, Inf),
+                                labels = c("Low", "High"))
+
+```
+
+```{r}
+### NEW COLUMN: C-peptide HIGH (900 or above) or LOW (below 900)
+ Cpepcutoff <-899
+ main2$Cpep900 <- cut(main2$cpep_pmol,
+                                 breaks = c(-Inf, Cpepcutoff, Inf),
+                                 labels = c("Low", "High"))
+
+```
+
+######################################################################################################
+######################################################################################################
+```{r}
+######## DATASET CLEANING FOR EXPLANATORY COVARIATES ########
+####### DISTRIBUTION OF EXPLANATORY COVARIATES #######
+# 1. Age at C-peptide testing
+# 2. Gender
+# 3. BMI
+# 4. Diabetes duration
+# 5. Time to insulin
+# 6. ALT
+# 7. Triglycerides
+# 8. HDL cholesterol
+# 9. Sulphonylurea prescription
+# 10. HbA1C
+# 11. Creatinine
+# 12. Basal bolus regime
+```
+
+```{r}
+### 1. AGE ###
+```
+```{r}
+summary(main2$AgeCpep)
+
+ggplot(main2, aes(x= AgeCpep)) + geom_histogram( binwidth = 10, fill = "#94D8E8") + theme_bw() + labs(x="Age", y = "Years", title = NULL) ### age histogram
+
+### age distribution stratified by high or low C-peptide
+ggplot (main2, aes(x= Cpep600, y = AgeCpep)) + geom_boxplot(width = 0.25 ) 
+ggplot (main2, aes(x= Cpep900, y = AgeCpep)) + geom_boxplot(width = 0.25 )
+```
+
+```{r}
+### 2. GENDER ###
+```
+```{r}
+sex <- table (main2$sex)
+print(sex)
+
+### Gender distribution stratified by C-peptide high or low
+ggplot(main2, aes(x = Cpep600, fill = sex)) + geom_bar(position = "dodge")
+ggplot(main2, aes(x = Cpep900, fill = sex)) + geom_bar(position = "dodge")
+```
+
+```{r}
+### 3. BMI ###
+```
+```{r}
+### Import BMI data from SQL server
+Diabetes_BMI<- tbl(conn, "Diabetes_BMI_Cleaned")
+patient_ids <- DemographyCpep35$PROCHI
+query <- Diabetes_BMI %>% filter(PROCHI %in% patient_ids)
+bmi_raw <- query %>% collect ()
+dim(bmi_raw) ###55168
+
+### create dataframe with ("PROCHI", "Date", "Calculated_BMI") columns
+bmi1 <- bmi_raw[,c("PROCHI", "Date", "Calculated_BMI")]
+dim(bmi1) ###55168
+length(unique(bmi1$PROCHI)) ###1203
+
+### merge BMI
+bmi2 <- merge(bmi1, cpep_df, all.x = TRUE, by ='PROCHI' )
+bmi2$Date <- as.Date(bmi2$Date)
+bmi2$cpeptide_date1 <- as.Date(bmi2$cpeptide_date1)
+length(unique(bmi2$PROCHI)) ###1203 
+
+### select BMI measured closest to C-peptide measurement using SLICE_MIN function
+bmi3 <- bmi2 %>% group_by(PROCHI) %>% mutate(BMIDate_min= (abs(cpeptide_date1 - Date))) %>% slice_min (BMIDate_min, with_ties = F)
+dim(bmi3) ### 1203
+
+### identify missing BMI values
+bmi3 %>% filter (is.na(Calculated_BMI)) ### 3 missing values - subsequently replaced with other measurements (within 3 years) found within GoFusion
+
+### exclude individuals with BMI measured >3 years (1096 days) from c-peptide measurement
+ bmi4 <- bmi3 %>% filter(BMIDate_min < 1096)
+dim(bmi4) ###1201
+
+### extract "PROCHI" and "Calculated_BMI" columns to combine with age and gender to form main dataframe
+bmi5 <- bmi4[,c("PROCHI", "Calculated_BMI")]
+main3 <- merge(main2, bmi5, by = 'PROCHI')
+dim(main3) ### 1201
+
+### BMI distribution
+summary (main3$Calculated_BMI)
+
+### BMI distribution stratified by C-peptide thresholds
+ggplot (main3, aes (x= Cpep600, y= Calculated_BMI)) + geom_boxplot (width = 0.25)
+summaryBMI_Cpep600 <- aggregate (main3$Calculated_BMI,
+                              by = list(main3$Cpep600),
+                              FUN = summary)
+ggplot (main3, aes (x= Cpep900, y= Calculated_BMI)) + geom_boxplot( width = 0.25)
+summaryBMI_Cpep900 <- aggregate (main3$Calculated_BMI,
+                              by = list(BMICpep4$Cpep900),
+                              FUN = summary)
+```
+
+```{r}
+### 4. Diabetes duration ###
+```
+```{r}
+main3 %>% select (PROCHI, Date_of_Diagnosis) %>%
+  filter (!complete.cases(.)) ### no missing dates
+### if there are IDs with unusual date of diagnosis (e.g."1900-01-01") replace with first HbA1c sampling date or first Metformin prescription date - whichever is earlier
+
+### calculate diabetes duration using the more updated Date of Diagnosis
+main3$Cpep_Date <- as.Date (main3$Cpep_Date)
+main3$Date_of_Diagnosis <- as.Date( main3$Date_of_Diagnosis )
+
+main4 <- main3 %>%
+  mutate (DiabDuration = as.numeric(difftime (Cpep_Date, Date_of_Diagnosis, units = "days"))/365.25)
+main4$DiabDuration <- ceiling (main4$DiabDuration )
+
+### distribution of diabetes duration stratified by C-peptide thresholds
+main4$Cpep600 <- factor (main4$Cpep600, levels = ,c("Low", "High"))
+main4$Cpep900 <- factor (main4$Cpep900, levels = ,c("Low", "High"))
+ggplot (main4, aes (x= Cpep600, y= DiabDuration)) + geom_boxplot (width = 0.25)
+summaryDiabduration_Cpep600 <- aggregate (main4$DiabDuration,
+                               by = list(main4$Cpep600),
+                               FUN = summary)
+ggplot (main4, aes (x= Cpep900, y= DiabDuration)) + geom_boxplot( width = 0.25)
+summaryDiabduration_Cpep900 <- aggregate (main4$DiabDuration,
+                               by = list(main4$Cpep900),
+                               FUN = summary)
+```
+
+```{r}
+### 5. Time to insulin
+```
+```{r}
+main4 <- main4 %>% rename(InsulinDate = corrected_PRESCRIBED_DATE) ### corrected_PRESCRIBED_DATE is the earliest insulin prescription date
+main4$InsulinDate <- as.Date(main4$InsulinDate)
+main4$Date_of_Diagnosis <- as.Date(main4$Date_of_Diagnosis)
+
+main5 <- main4 %>%
+  mutate (TimeToInsulin = as.numeric(difftime (InsulinDate, Date_of_Diagnosis, units = "days"))/365.25)
+main5$TimeToInsulin <- ceiling (main5$TimeToInsulin)
+```
+
+```{r}
+### import biochemistry data for PROCHI in main5 dataframe
+```
+```{r}
+biochem <-tbl(conn, "Labs_Biochem")
+patient_ids <- main5$PROCHI
+length(patient_ids) ### 1201
+query <- biochem %>% filter(PROCHI %in% patient_ids )
+biochem_raw <- query %>% collect()
+dim(biochem_raw) ###1996904
+
+biochem_raw$DateTimeSampled <- as.Date(biochem_raw$DateTimeSampled)
+colnames(biochem_raw)[colnames(biochem_raw) == "DateTimeSampled"] <- "DateSampled"
+```
+
+```{r}
+### 6. ALT ###
+```
+```{r}
+### extract ALT data is stored as ReadCodeValue "44G3." and "44GB."
+alt_raw <- biochem_raw %>% select(PROCHI, DateSampled, QuantityValue, QuantityUnit) %>%
+ filter(biochem_raw$ReadCodeValue %in% c("44G3.", "44GB."))
+length(unique(alt_raw$PROCHI)) 
+
+### merge alt_raw with main5 PROCHI for C-peptide date and value ###
+ main_sub <- subset(main5, select = c(PROCHI, Cpep_Date, cpep_pmol))
+alt1 <- merge(main_sub , alt_raw, by = "PROCHI", all.x = TRUE)
+length(unique(alt1$PROCHI)) ### 1201
+
+### ALT within 365 days of C-peptide measurement
+alt1$Cpep_Date <- as.Date(alt1$Cpep_Date)
+alt1$DateSampled <- as.Date(alt1$DateSampled)
+alt2 <- alt1 %>% group_by(PROCHI) %>% mutate(ALTDate_min= (abs(Cpep_Date - DateSampled))) %>% slice_min (ALTDate_min, with_ties = F)
+alt2 %>% filter(is.na(QuantityValue))### 92 PROCHI WITH NO ALT <365 DAYS OR NO ALT AT ALL
+
+### find distribution of ALT within 12 months timeframe of C-peptide measurement
+alt3 <-alt2 %>% group_by(PROCHI) %>% mutate(ALTDate = abs (Cpep_Date - DateSampled)) %>% filter(ALTDate < 365)
+summary(alt3$QuantityValue)
+### replace missing values and those >=365 days with median of ALT values within 12 months of C-peptide measurement
+alt3$ALT <- ifelse ((alt3$ALTDate_min > 364), 23 , alt3$QuantityValue)
+alt3$ALT <- ifelse (is.na(alt3$QuantityValue), 23 , alt3$QuantityValue)
+
+### ALT distribution
+summary(alt3$ALT)
+ggplot(alt3, aes (y = ALT)) + geom_boxplot( width = 0.25)
+ggplot(alt3, aes (x=ALT, y= cpep_pmol)) + geom_point()
+
+### clean outlier values
+alt_sub <- alt3 %>% filter(ALT >150) ### subset PROCHI with ALT >150 to replace them with mean of high ALT values 
+alt_sub <- alt_sub %>% group_by(PROCHI) %>% mutate (ALTmean = (mean(QuantityValue))) ## add column for meanALT
+
+## merge alt3 and alt_sub dataframes, then create a new column (NewALT) and replace NewALT with ALTmean if original ALT >150
+alt4 <- merge (alt3, alt_sub, by= 'PROCHI', all.x = TRUE) ###1201
+alt4$NewALT <- ifelse((alt4$NewALT>150), alt4$ALTmean, alt4$ALT)
+
+### merge alt4 with main5 dataframe
+alt5 <- subset(alt4, select = c(PROCHI, NewALT))
+main6 <- merge (main5, alt5, by= 'PROCHI' )
+length(unique(main6$PROCHI)) ### 1201
+```
+
+```{r}
+### 7. TRIGLYCERIDES (TG) ###
+```
+```{r}
+tg_raw <- biochem_raw %>% select(PROCHI, DateSampled, QuantityValue, QuantityUnit) %>%
+ filter(biochem_raw$ReadCodeValue %in% c("44Q.."))
+length(unique(tg_raw$PROCHI)) ### 1197
+
+tg1<- merge(main_sub, tg_raw, by = "PROCHI", all.x = TRUE) ### merge with main df PROCHI
+length(unique(tg1$PROCHI)) ### 1201
+
+### check for missing TG value and PROCHI without TG within 365 days of C-peptide measurement
+tg1$Cpep_Date <- as.Date(tg1$Cpep_Date)
+tg1$DateSampled <- as.Date(tg1$DateSampled)
+tg1 <- tg1 %>% group_by(PROCHI) %>% mutate(TGDate_min= (abs(Cpep_Date - DateSampled))) %>% slice_min (TGDate_min, with_ties = F)
+tg1 %>% filter(is.na(QuantityValue)) ### 26 PROCHI WITH NO TG <365 DAYS FROM CPEPDATE 
+
+### find distribution of TG (single closest TG value to C-peptide and within 12 months timeframe)
+tg_sub <- tg1 %>% filter(TGDate_min <365) ### 1171
+summary(tg_sub$QuantityValue)
+
+### replace missing values and those >=365 days with median TG (median of all TG values within 12 months of C-pep)
+tg1$NewTG <- ifelse((tg1$TGDate_min >364), 1.90, tg1$QuantityValue)
+tg1$NewTG <- ifelse(is.na(tg1$NewTG), 1.90, tg1$NewTG)
+
+### TG distribution
+summary(tg1$NewTG)
+### all TG <20 therefore not cleaned for outliers
+
+### merge TG with main dataframe 
+tg2 <- subset(tg1, select = c(PROCHI, NewTG))
+main7 <- merge (main6, tg2, by= 'PROCHI' )
+```
+
+```{r}
+### 8. HDL CHOLESTEROL ###
+```
+```{r}
+hdl_raw <- biochem_raw %>% select(PROCHI, DateSampled, QuantityValue, QuantityUnit) %>%
+ filter(biochem_raw$LocalClinicalCodeValue %in% c("HDL", "AHDL-C", "SHDL", "JHDL", "HDL_CHOL", "HDLC"))
+length(unique(hdl_raw $PROCHI)) ###1201
+hdl1<- merge(main_sub, hdl_raw, by = "PROCHI", all.x = TRUE) # merge with main dataframe PROCHI for c-peptide date
+
+### check for missing HDL value and PROCHI without HDL within 365 days of C-peptide measurement
+hdl1$Cpep_Date <- as.Date(hdl1$Cpep_Date)
+hdl1$DateSampled <- as.Date(hdl1$DateSampled)
+hdl1 <- hdl1 %>% group_by(PROCHI) %>% mutate(HDLDate_min= (abs(Cpep_Date - DateSampled))) %>% slice_min (HDLDate_min, with_ties = F)
+hdl1 %>% filter(is.na(QuantityValue)) ### 7 PROCHI WITH NO HDL <365 DAYS FROM CPEP MEASUREMENT
+
+### find distribution of ALT (single closest ALT value to C-peptide and within 12 months timeframe)
+hdl_sub <- hdl1 %>% filter(HDLDate_min <365) ### 1194
+summary(hdl_sub$QuantityValue)
+
+### replace missing values and those >=365 days with median HDL (median of all HDL values within 12 months of C-pep)
+hdl1$NewHDL <- ifelse((hdl1$HDLDate_min >364), 1.25, hdl1$QuantityValue)
+hdl1$NewHDL <- ifelse (is.na(hdl1$NewHDL), 1.25, hdl1$NewHDL)
+
+### TG distribution
+summary(hdl1$NewHDL)
+
+### merge HDL with main7 dataframe 
+hdl2 <- subset(hdl1, select = c(PROCHI, NewHDL))
+main8 <- merge (main7, hdl2, by= 'PROCHI' )
+```
+
+```{r}
+### 9. SULPHONYLUREA (SU) PRESCRIPTION (YES/NO) ###
+```
+```{r}
+sulphonylurea <- PrescribingItems [c(PrescribingItems$formatted_BNF_Code %in% "6.1.2.1"),] ###extract res_seqno (code) of SU based on BNF code 6.1.2.1 
+
+### list of patients on SU
+su_raw <- merge(oninsulin7, sulphonylurea, by = 'res_seqno')
+dim(su_raw) ### 33069
+length(unique(su_raw$PROCHI)) ### 985 individuals had been on SU at some point
+
+### range of duration between su prescription date and Cpep date 
+su <- subset(su_raw, select = c("PROCHI", "corrected_PRESCRIBED_DATE", "quantity", "directions", "Approved_Name"))
+su2 <- merge(main_sub, su, by = "PROCHI", all.y = TRUE)
+dim(su2) 
+length(unique(su2$PROCHI)) ##985
+
+### latest SU date prior to Cpep measurement
+su2$Cpep_Date <- as.Date(su2$Cpep_Date)
+su2$corrected_PRESCRIBED_DATE <- as.Date(su2$corrected_PRESCRIBED_DATE)
+su2 <- su2 %>% group_by(PROCHI) %>% mutate(SUlatestdate_min = (Cpep_Date - corrected_PRESCRIBED_DATE)) 
+su3 <- su2 %>% filter(SUlatestdate_min > 0)
+length(unique(su3$PROCHI)) ### 970 individuals on SU before Cpep measurement
+
+su4 <- su3 %>% slice_min(SUlatestdate_min)
+dim(su4) 
+length(unique(su4$PROCHI)) ### 970
+su4 <- su4[!duplicated(su4$PROCHI),]
+dim(su4) ### 970
+su4$SUlatestdate_min <- as.numeric(su4$SUlatestdate_min)
+summary(su4$SUlatestdate_min) 
+   # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   #  1.0   798.5  1540.5  1759.9  2310.5 10083.0 
+### most people not on SU near Cpep measurement
+### only 42 with latest SU prescription within 6 months prior to Cpep
+### only 95 with latest SU  prescription within 12 months prior to Cpep
+
+### find prescription date closes to C-peptide then select those within 6 months
+su2$Cpep_Date <- as.Date(su2$Cpep_Date)
+su2$corrected_PRESCRIBED_DATE <- as.Date(su2$corrected_PRESCRIBED_DATE)
+su2 <- su2 %>% group_by(PROCHI) %>% mutate(SUlatestdate_min = (abs(Cpep_Date - corrected_PRESCRIBED_DATE))) 
+su5 <- su2 %>% slice_min(SUlatestdate_min, with_ties = F) %>% filter(SUlatestdate_min < 180)
+
+### merge su5 and main8 dataframes
+su5$OnSU <- "Yes" #create new column for OnSU=Yes
+su6 <- subset(su5, select = c(PROCHI, OnSU))
+main9 <- merge (main8, su6, by= 'PROCHI' , all.x=TRUE )
+main9 <- main9 %>% mutate (OnSU = replace_na(OnSU, "No")) # replace OnSU=na with 'NO'
+```
+
+```{r}
+### 10. HbA1c ###
+```
+```{r}
+###import HbA1C data
+ hba1c_raw <- biochem_raw %>% select(PROCHI, DateSampled, QuantityValue, QuantityUnit) %>%
+ filter(biochem_raw$ReadCodeValue %in% c("42W4.", "42W5." , "44TB."))
+length(unique(hba1c_raw$PROCHI)) ###1201
+
+
+hba1c1 <- merge(main_sub,hba1c_raw, by= 'PROCHI') # merge with main dataframe PROCHI
+length(unique(hba1c1$PROCHI)) ###1201
+ hba1c1 %>% filter(is.na(QuantityValue)) ### 614 rows without HbA1C value
+hba1c2 <- hba1c1 %>% filter (!is.na(QuantityValue))  ###remove rows without HbA1C 
+ length(unique(hba1c2$PROCHI)) ### 1201 - no missing individuals after removing empty HbA1C values
+ 
+### standardise HbA1C to mmol/mol
+hba1c3 <- hba1c2 %>% filter(QuantityValue <20) #hba1c3 is df of HbA1c in %
+hba1c4 <- hba1c2 %>% filter(QuantityValue >=20)#hba1c4 is df of HbA1c in mmol/mol
+
+### hba1c3 (HbA1c in %)
+### remove any value <5.4% (=35mmol/mol)
+hba1c3a <- hba1c3 %>% filter(QuantityValue >=5.4)
+### then convert all to mmol/mol using formula
+hba1c3a <- hba1c3a %>% mutate (NewHbA1C = ((QuantityValue-2.15)*10.929))
+hba1c3a$NewHbA1C <- round (hba1c3a$NewHbA1C, digits=1)
+hba1c3b <- hba1c3a[,c('PROCHI','cpep_pmol','Cpep_Date','Cpep600','Cpep900','DateSampled','NewHbA1C')]
+
+### hba1c4 (HbA1c in mmol/mol)
+### remove any value <35mmol/mol
+hba1c4a <- hba1c4 %>% filter(QuantityValue >=35)
+hba1c4a$QuantityValue <- round(hba1c4a$QuantityValue ,digits=1)
+colnames(hba1c4a)[7] <- "NewHbA1C"
+hba1c4b <- hba1c4a[,c('PROCHI','cpep_pmol','Cpep_Date','Cpep600','Cpep900','DateSampled','NewHbA1C')]
+
+###combine hba1c3b and hba1c4b 
+hba1c5 <- rbind(hba1c3b, hba1c4b)
+dim(hba1c5) ###63276
+length(unique(hba1c5$PROCHI)) ###1201
+
+
+hba1c5$Cpep_Date <- as.Date(hba1c5$Cpep_Date)
+hba1c5$DateSampled <- as.Date(hba1c5$DateSampled )
+hba1c5 <- hba1c5 %>% group_by(PROCHI) %>% mutate(HbA1Cgap = (abs(Cpep_Date - DateSampled)))
+hba1c6 <- hba1c5 %>% group_by(PROCHI) %>% slice_min(HbA1Cgap,with_ties = F)
+dim(hba1c6) ###1201
+length(unique(hba1c6$PROCHI)) ###1201
+
+###calculate median value of HbA1c values within 12 months of C-peptide measurement
+hba1c_sub <- hba1c6 %>% filter(HbA1Cgap <180)
+summary(hba1c_sub$NewHbA1C)
+   # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   # 21.3    56.3    67.2    69.4    80.3   142.6 
+
+### replace all more than 6 months with median value 67.2
+hba1c7 <- hba1c6 %>% mutate(NewHbA1C2 = (ifelse(HbA1Cgap >=180,medianHbA1C, NewHbA1C)))
+ggplot(hba1c7, aes(x=NewHbA1C2, y=cpep_pmol)) + geom_point() + geom_smooth(method = lm, se= F)
+summary(hba1c7$NewHbA1C2)
+
+### merge hba1c7 and main9 dataframes
+hba1c8 <- hba1c7[,c('PROCHI', 'NewHbA1C2')]
+main10 <- merge(main9, hba1c8, by="PROCHI")
+dim(main10)
+length(unique(main10))
+```
+
+```{r}
+### 11. CREATININE ###
+```
+```{r}
+### import creatinine data from biochemraw
+creat_raw <- biochem_raw %>% select(PROCHI, DateSampled, QuantityValue, QuantityUnit) %>%
+ filter(biochem_raw$ReadCodeValue %in% c("44J3."))
+dim(creat_raw) 
+length(unique(creat_raw$PROCHI)) 
+
+creat1 <- merge(main_sub, creat_raw, by = 'PROCHI') # merge with main df PROCHI
+dim(creat1)
+
+### Creatinine measurement within 12 months before or after C-peptide
+creat1$Cpep_Date <- as.Date(creat1$Cpep_Date)
+creat1$DateSampled <- as.Date(creat1$DateSampled)
+creat2 <- creat1 %>% group_by(PROCHI) %>% mutate(latestcreat_min = (abs(Cpep_Date - DateSampled))) %>% slice_min(latestcreat_min, with_ties = F) 
+creat2 <- creat2 %>% filter(!is.na(QuantityValue))
+creat3 <- creat2 %>% filter (QuantityValue >300)
+dim(creat3)
+length(unique(creat3$PROCHI)) 
+creat3 <- creat3 %>% rename(Creatinine = QuantityValue)
+
+### merge creat3 and main10 dataframes
+creat4 <- creat3[,c("PROCHI", "Creatinine")]
+main11 <- merge(main10, creat4, by="PROCHI")
+dim(main11) ### 1201
+length(unique(main11$PROCHI)) ###1201
+```
+
+```{r}
+### 12. BASAL BOLUS INSULIN REGIME (YES/NO) ###
+```
+```{r}
+### types of insulin to determine insulin regimE
+
+degludec <- oninsulin [grepl("DEGLUDEC", oninsulin$Approved_Name),]
+degludecname <- unique(degludec$Name)
+print(degludecname) ###  "TRESIBA PENFILL"   "TRESIBA FLEXTOUCH" "XULTOPHY"    
+
+glargine <- oninsulin [grepl("GLARGINE",oninsulin$Approved_Name),]
+glarginename <- unique(glargine$Name)
+print(glarginename) ### "LANTUS" "LANTUS OPTISET"   "LANTUS OPTICLICK" "LANTUS SOLOSTAR"  "TOUJEO SOLOSTAR" "ABASAGLAR"
+
+detemir <- oninsulin [grepl("DETEMIR",oninsulin$Approved_Name),]
+detemirname <-unique(detemir$Name)
+print(detemirname) ### "LEVEMIR PENFILL" "LEVEMIR FLEXPEN" "LEVEMIR INNOLET"
+
+aspart <- oninsulin [grepl("ASPART",oninsulin$Approved_Name),]
+aspartname <-unique(aspart$Name)
+print(aspartname)
+# "NOVORAPID"           "NOVORAPID PENFILL"   "NOVORAPID NOVOLET"   "NOVOMIX 30 PENFILL"  "NOVOMIX 30 FLEXPEN" 
+# "NOVORAPID FLEXPEN"   "NOVORAPID FLEXTOUCH"
+
+glulisine <- oninsulin [grepl("GLULISINE",oninsulin$Approved_Name),]
+glulisinename <-unique(glulisine$Name)
+print(glulisinename) ###  "APIDRA"          "APIDRA SOLOSTAR"
+
+lispro <- oninsulin [grepl("LISPRO",oninsulin$Approved_Name),]
+lisproname <-unique(lispro$Name)
+print(lisproname) ### "HUMALOG"        "HUMALOG MIX 25" "HUMALOG MIX 50"
+
+neutral <- oninsulin [grepl("NEUTRAL", oninsulin$Approved_Name),]
+neutralname <- unique(neutral$Name)
+print(neutralname)
+#  [1] "HYPURIN BOVINE NEUTRAL"  "HUMAN ACTRAPID"          "HUMULIN S"               "PORK VELOSULIN"         
+#  [5] "VELOSULIN"               "HUMAN VELOSULIN"         "HUMAJECT S HUMAN"        "HYPURIN PORCINE NEUTRAL"
+#  [9] "PORK ACTRAPID"           "INSUMAN RAPID"           "ACTRAPID NOVOLET"        "ACTRAPID PENFILL"       
+# [13] "ACTRAPID"   
+
+
+oninsulin8 <- oninsulin[,c("PROCHI","corrected_PRESCRIBED_DATE","quantity","directions","Name", "Approved_Name")]
+insulin1 <- merge(main_sub, oninsulin8, by = 'PROCHI', all.x = T) # merge with main dataframe PROCHI
+dim(insulin1) ### 153822
+length(unique(insulin1$PROCHI)) ### 1201
+
+###### find those on basal and bolus regime ######
+basalbolus_loop <- list()
+pt_ids <- unique(insulin2A$PROCHI)
+for (i in 1:length(pt_ids)){
+  print(i)
+  temp_id <- pt_ids[i]
+  temp_df2 <- subset(insulin2A, PROCHI == temp_id)
+  
+  bolus <- grep("\\b(NOVORAPID|APIDRA|HUMALOG|HUMULIN S)\\b", temp_df2$Name, value=TRUE)
+  intermediate <- grep("\\b(INSULATARD|HUMULIN I)\\b", temp_df2$Name, value=TRUE)
+  basal <- grep("\\b(DETEMIR|GLARGINE|DEGLUDEC)\\b", temp_df2$Approved_Name, value = TRUE)
+
+  bolus_count <- length(bolus)
+  print(bolus_count)
+  intermediate_count <- length(intermediate)
+  print(intermediate_count)
+  basal_count <- length(basal)
+  print(basal_count)
+
+  if (bolus_count >1 & (basal_count >1 | intermediate_count >1)) {
+  temp_df2$Decision <- 1
+  }else {temp_df2$Decision <-0}
+
+  temp_df2.list <- list(temp_df2)
+  basalbolus_loop <- append(basalbolus_loop, temp_df2.list)
+}
+
+basalbolus <- do.call(rbind, basalbolus_loop)
+dim(basalbolus)
+length(unique(basalbolus$PROCHI))
+
+### extract those with decision 1
+basalbolus2 <- basalbolus %>% filter(Decision == 1)
+basalbolus2 <- basalbolus2[!duplicated(basalbolus2$PROCHI),]
+dim(basalbolus2) 
+
+### add column BasalBolus to combine to main cohort later
+basalbolus2$BasalBolus <- "Yes"
+
+### merge basalbolus2 and insulin1 dataframes
+basalbolus3 <- basalbolus2[,c("PROCHI", "BasalBolus")]
+insulin2 <- merge(insulin1, basalbolus3, by="PROCHI", all.x = TRUE)
+insulin2$BasalBolus <- ifelse(is.na(insulin2$BasalBolus), "No", insulin2$BasalBolus) ### rename the NA values in BasalBolus to "No"
+insulin2 %>% filter(is.na(BasalBolus)) 
+dim(insulin2) 
+length(unique(insulin2$PROCHI)) 
+
+insulin3 <- insulin2[!duplicated(insulin2$PROCHI),] ###  deduplicate insulin2
+dim(insulin3) ### 1201
+
+### merge insulin3 and main11 dataframes
+insulin4 <- insulin3[,c("PROCHI", "BasalBolus")]
+main12 <- merge(main11, insulin4, by="PROCHI")
+dim(main12) ### 1201
+length(unique(main12$PROCHI)) ###1201
+```
+
+######################################################################################################
+######################################################################################################
+
+```{r}
+### main12 is the main dataframe with all individual PROCHIs, explanatory variables and outcome variable (C-peptide level, C-peptide categories: High or Low determined by threshold 600pmol/L and 900pmol/L)
+
+### transform qualitative variables to FACTORS
+## Cpep600 and Cpep900
+main12$Cpep600 <- factor(main12$Cpep600, levels = c("Low","High"), labels = c("Low","High"))
+main12$Cpep900 <- factor(main12$Cpep900, levels = c("Low","High"), labels = c("Low","High")) 
+## Gender, OnSu, BasalBolus
+main12$sex<- factor(main12$sex, levels = c("M","F"), labels = c("M","F"))
+main12$OnSU<- factor(main12$OnSU, levels = c("Yes","No"), labels = c("T","F"))
+main12$BasalBolus<- factor(main12$BasalBolus, levels = c("Yes","No"), labels = c("T","F"))
+```
+
+######################################################################################################
+######################################################################################################
+```{r}
+########## PRIMARY ANALYSIS ########## 
+
+##### MULTIVARIABLE BINARY LOGISTIC REGRESSION #####
+### C-peptide outcome threshold: 600pmol/L
+### C-peptide >=600 = High ###
+### C-peptide <600 = Low ### 
+
+##### SPLITTING MAIN5 DATAFRAME TO TRAINING AND TESTING DATA #####
+### 80:20
+```
+```{r}
+set.seed(42) ## set seed to generate a reproducible random sample
+train_index <- createDataPartition(main12$Cpep600, p=0.8, list=FALSE) ## split into 80% training, 20% testing
+main12_trainlog <- main12[train_index,]
+main12_testlog <- main12[-train_index,]
+dim(main12_trainlog) 
+dim(main12_testlog) 
+```
+
+```{r}
+########## MODEL DEVELOPMENT ########## 
+```
+
+```{r}
+# COLLINEARITY OF VARIABLES ASSESSED - TimeToInsulin and DiabDuration have high collinearity
+###### modela1 - no polynomial or transformation
+###### modelb1 - without 'TimeToInsulin' built for comparison with modela1.4 (MSM of modela1)
+###### modelc1- without 'DiabDuration' built for comparison with modela1.4 (MSM of modela1)
+###### modela2 - including Polynomial terms for continuous covariates
+###### modela3 - polynomial power -0.5 for triglycerides (identified using 'mfp' package) ###### selected as best performing model, named as 'FULL MODEL' in manuscript
+###### modelg1 - polynomial power -0.5 for triglycerides, built using stepwise 
+###### modelg2 - polynomial power -0.5 for triglycerides, built using both directions
+###### modela5.1 - simplified model with 4 readily available clinical variables ###### names as 'BASIC MODEL' in manuscript
+```
+
+```{r}
+#####  ASSESS COLLINEARITY FOR ALL VARIABLES #####
+```
+```{r}
+### Variance Inflation Factor ### (VIF <4 means no significant collinearity)
+## create a model that includes 12 variables (using MAIN5)(exclude HBSIMD5 and waist circumference - NAs)
+model <- glm(Cpep600 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewALT2 + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + Creatinine, data=main12, family= "binomial")
+summary(model)
+vif_model <- data.frame(ols_vif_tol(model))
+eigen_model <- data.frame(ols_eigen_cindex(model))
+
+### Correlation matrix ###
+## create df for correlation matrix (remove unnecessary columns and categorical variables)
+df_corr <- main12[,c("AgeCpep", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL", "NewHbA1C2", "Creatinine")]
+df_corr <- df_corr %>% rename(
+  Age = AgeCpep,
+BMI = Calculated_BMI, 
+  ALT = NewALT2, 
+  TG = NewTG, 
+  HDL = NewHDL, 
+  HbA1C = NewHbA1C2)
+ggpairs(df_corr, upper = list(continuous = wrap("cor", size=2.5)))
+
+### DiabDuration and TimeToInsulin are highly correlated 0.812
+### Models without DiabDuration (Model C) or TimeToInsulin (Model B) build for comparison
+
+### Correlation matrix Heatmap ###
+corr <- cor(df_corr)
+corrplot(corr, method="number")
+corrplot(corr, method="circle")
+corrplot(corr, type="upper", order="hclust")
+### Correlation matrix Heatmap with p-value ###
+cor.mtest <- function (mat, ...){
+  mat <- as.matrix(mat)
+  n <- ncol(mat)
+  p.mat <- matrix (NA,n,n)
+  diag(p.mat) <-0
+  for(i in 1:(n-1)){
+    for(j in (i+1):n){
+      tmp <- cor.test(mat[,i], mat[,j], ...)
+      p.mat[i,j] <- p.mat[j,i] <- tmp$p.value
+    }
+  }
+  colnames(p.mat) <-rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+p.mat <- cor.mtest(df_corr)
+head(p.mat[,1:5])
+
+corrplot(corr, type="upper", order="hclust",
+         p.mat = p.mat, sig.level=0.05)
+```
+
+```{r}
+### MODEL A ### 
+```
+```{r}
+df_modela <- main12_trainlog[,c("sex", "AgeCpep", "Cpep600", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL", "OnSU", "BasalBolus", "NewHbA1C2", "Creatinine")]
+```
+
+```{r}
+### modela1 - no polynomial or transformation
+```
+```{r}
+modela1.1 <- glm(Cpep600 ~., data=df_modela, family = "binomial")
+summary(modela1.1)
+# Coefficients:
+#                  Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -0.3542501  1.1507696  -0.308 0.758206    
+# sexF            0.6124576  0.1878646   3.260 0.001114 ** 
+# AgeCpep         0.0056658  0.0101987   0.556 0.578521    
+# Calculated_BMI  0.0619870  0.0161039   3.849 0.000119 ***
+# DiabDuration   -0.1431666  0.0216052  -6.626 3.44e-11 ***
+# TimeToInsulin   0.1217094  0.0249947   4.869 1.12e-06 ***
+# NewALT2         0.0004954  0.0056996   0.087 0.930739    
+# NewTG           0.4387819  0.0947837   4.629 3.67e-06 ***
+# NewHDL         -1.1511581  0.2352566  -4.893 9.92e-07 ***
+# OnSUF          -0.4584126  0.5407953  -0.848 0.396625    
+# BasalBolusF     1.4026913  0.2616165   5.362 8.25e-08 ***
+# NewHbA1C2      -0.0197039  0.0049249  -4.001 6.31e-05 ***
+# Creatinine      0.0105118  0.0033309   3.156 0.001600 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  858.93  on 941  degrees of freedom
+# AIC: 884.93
+# 
+# Number of Fisher Scoring iterations: 5
+
+### at 5% significance level, variables that are significantly associated are: sex, BMI, diabetes duration, time to insulin, triglycerides, HDL, basal bolus insulin prescription, HbA1C and creatinine
+
+Anova(modela1.1, type="2") ### run Anova type 2 as summary() defaults to type 1 (which assumes one covariate is more important than others)
+# Analysis of Deviance Table (Type II tests)
+# 
+# Response: Cpep600
+#                LR Chisq Df Pr(>Chisq)    
+# sex              10.868  1  0.0009783 ***
+# AgeCpep           0.308  1  0.5787816    
+# Calculated_BMI   16.024  1  6.256e-05 ***
+# DiabDuration     47.729  1  4.893e-12 ***
+# TimeToInsulin    25.054  1  5.575e-07 ***
+# NewALT2           0.008  1  0.9306493    
+# NewTG            31.275  1  2.239e-08 ***
+# NewHDL           26.313  1  2.903e-07 ***
+# OnSU              0.776  1  0.3784788    
+# BasalBolus       29.085  1  6.925e-08 ***
+# NewHbA1C2        16.257  1  5.530e-05 ***
+# Creatinine       10.855  1  0.0009853 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+
+
+### remove non-significant explanatory covariates for MSM ### 
+### starting with least significant ###
+### remove NewALT2
+modela1.2 <- with(df_modela, glm(Cpep600 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + Creatinine, family = "binomial"))
+summary(modela1.2)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -0.325701   1.103083  -0.295 0.767792    
+# sexF            0.610619   0.186643   3.272 0.001069 ** 
+# AgeCpep         0.005521   0.010062   0.549 0.583224    
+# Calculated_BMI  0.062059   0.016086   3.858 0.000114 ***
+# DiabDuration   -0.143203   0.021602  -6.629 3.38e-11 ***
+# TimeToInsulin   0.121777   0.024984   4.874 1.09e-06 ***
+# NewTG           0.439297   0.094646   4.641 3.46e-06 ***
+# NewHDL         -1.152233   0.234981  -4.904 9.41e-07 ***
+# OnSUF          -0.462422   0.539123  -0.858 0.391042    
+# BasalBolusF     1.402899   0.261597   5.363 8.19e-08 ***
+# NewHbA1C2      -0.019720   0.004921  -4.007 6.14e-05 ***
+# Creatinine      0.010492   0.003324   3.157 0.001596 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  858.94  on 942  degrees of freedom
+# AIC: 882.94
+# 
+# Number of Fisher Scoring iterations: 5
+
+Anova(modela1.2, type="2")
+#                LR Chisq Df Pr(>Chisq)    
+# sex              10.936  1  0.0009429 ***
+# AgeCpep           0.301  1  0.5834767    
+# Calculated_BMI   16.084  1  6.061e-05 ***
+# DiabDuration     47.777  1  4.776e-12 ***
+# TimeToInsulin    25.105  1  5.428e-07 ***
+# NewTG            31.401  1  2.099e-08 ***
+# NewHDL           26.400  1  2.776e-07 ***
+# OnSU              0.795  1  0.3726691    
+# BasalBolus       29.101  1  6.868e-08 ***
+# NewHbA1C2        16.320  1  5.348e-05 ***
+# Creatinine       10.881  1  0.0009716 ***
+
+
+### remove AgeCpep
+modela1.3 <- with(df_modela, glm(Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + Creatinine, family = "binomial"))
+summary(modela1.3)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -0.001173   0.931558  -0.001 0.998995    
+# sexF            0.620229   0.185776   3.339 0.000842 ***
+# Calculated_BMI  0.061106   0.015987   3.822 0.000132 ***
+# DiabDuration   -0.140748   0.021117  -6.665 2.64e-11 ***
+# TimeToInsulin   0.121158   0.024964   4.853 1.21e-06 ***
+# NewTG           0.434689   0.094283   4.610 4.02e-06 ***
+# NewHDL         -1.141981   0.233747  -4.886 1.03e-06 ***
+# OnSUF          -0.472171   0.539771  -0.875 0.381703    
+# BasalBolusF     1.439743   0.253081   5.689 1.28e-08 ***
+# NewHbA1C2      -0.020313   0.004806  -4.227 2.37e-05 ***
+# Creatinine      0.011074   0.003161   3.504 0.000459 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  859.24  on 943  degrees of freedom
+# AIC: 881.24
+# 
+# Number of Fisher Scoring iterations: 5
+
+Anova(modela1.3, type="2")
+#                LR Chisq Df Pr(>Chisq)    
+# sex              11.404  1  0.0007329 ***
+# Calculated_BMI   15.791  1  7.075e-05 ***
+# DiabDuration     48.400  1  3.475e-12 ***
+# TimeToInsulin    24.895  1  6.055e-07 ***
+# NewTG            31.113  1  2.435e-08 ***
+# NewHDL           26.140  1  3.176e-07 ***
+# OnSU              0.828  1  0.3628363    
+# BasalBolus       32.660  1  1.098e-08 ***
+# NewHbA1C2        18.159  1  2.032e-05 ***
+# Creatinine       13.580  1  0.0002287 ***
+
+
+### remove OnSU
+modela1.4 <- with(df_modela, glm(Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine, family = "binomial"))
+summary(modela1.4)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)
+# (Intercept)    -0.416249   0.796610  -0.523 0.601305
+# sexF            0.615215   0.185822   3.311 0.000930 ***
+# Calculated_BMI  0.060666   0.015900   3.815 0.000136 ***
+# DiabDuration   -0.143201   0.020963  -6.831 8.43e-12 ***
+# TimeToInsulin   0.123460   0.024854   4.967 6.78e-07 ***
+# NewTG           0.433525   0.094311   4.597 4.29e-06 ***
+# NewHDL         -1.158976   0.233145  -4.971 6.66e-07 ***
+# BasalBolusF     1.443776   0.253251   5.701 1.19e-08 ***
+# NewHbA1C2      -0.020173   0.004804  -4.200 2.67e-05 ***
+# Creatinine      0.011079   0.003163   3.502 0.000461 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  860.07  on 944  degrees of freedom
+# AIC: 880.07
+# 
+# Number of Fisher Scoring iterations: 5
+Anova(modela1.4, type="2")
+#                LR Chisq Df Pr(>Chisq)
+# sex              11.216  1  0.0008109 ***
+# Calculated_BMI   15.729  1  7.310e-05 ***
+# DiabDuration     50.992  1  9.277e-13 ***
+# TimeToInsulin    26.110  1  3.225e-07 ***
+# NewTG            30.888  1  2.733e-08 ***
+# NewHDL           27.096  1  1.935e-07 ***
+# BasalBolus       32.795  1  1.024e-08 ***
+# NewHbA1C2        17.922  1  2.301e-05 ***
+# Creatinine       13.564  1  0.0002305 ***
+
+### all explanatory covariates are significant now. 
+
+
+### try using STEP function to reduce model automatically
+modela1.5 <- step(modela1)
+### modela1.5 is similar to manually modelled MSM (modela1.4)
+
+
+
+### compare MSM (modela1.4) with maximal model (modela1.1)
+anova(modela1.1,modela1.4, test="Chi")
+# Analysis of Deviance Table
+# 
+# Model 1: Cpep600 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewALT2 + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + 
+#     Creatinine
+# Model 2: Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine
+#   Resid. Df Resid. Dev Df Deviance Pr(>Chi)
+# 1       941     858.93                     
+# 2       944     860.07 -3  -1.1363   0.7683
+
+### No significant difference in residual deviation between both models (p>0.05) and AIC values are similar (884.93 for modela1.1 vs 880.07 for modela1.4)
+### Therefore modela1.4 (MSM) is preferred 
+```
+
+```{r}
+### MODEL B - without Time To Insulin ###
+```
+```{r}
+df_modelb <- main12_trainlog[,c("sex", "AgeCpep", "Cpep600", "Calculated_BMI", "DiabDuration", "NewALT2", "NewTG", "NewHDL", "OnSU", "BasalBolus", "NewHbA1C2", "Creatinine")]
+
+### modelb1 - no transformation or polynomial term
+### build maximal model then use backwards elimination to build MSM
+modelb1.1 <- glm(Cpep600~., data=df_modelb, family="binomial")
+drop1(modelb1.1, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              883.98 907.98                     
+# sex             1   892.37 914.37  8.387  0.003779 ** 
+# AgeCpep         1   884.10 906.10  0.112  0.737503    
+# Calculated_BMI  1   901.13 923.13 17.141 3.470e-05 ***
+# DiabDuration    1   907.63 929.63 23.645 1.158e-06 ***
+# NewALT2         1   884.04 906.04  0.059  0.808349    
+# NewTG           1   915.01 937.01 31.029 2.543e-08 ***
+# NewHDL          1   912.71 934.71 28.723 8.349e-08 ***
+# OnSU            1   885.91 907.91  1.930  0.164716    
+# BasalBolus      1   921.94 943.94 37.954 7.243e-10 ***
+# NewHbA1C2       1   904.66 926.66 20.676 5.438e-06 ***
+# Creatinine      1   893.29 915.29  9.301  0.002290 ** 
+
+###drop NewALT2
+modelb1.2 <- update(modelb1.1, ~.-NewALT2)
+drop1(modelb1.2, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              884.04 906.04                     
+# sex             1   892.38 912.38  8.339  0.003881 ** 
+# AgeCpep         1   884.13 904.13  0.090  0.764064    
+# Calculated_BMI  1   901.30 921.30 17.259 3.262e-05 ***
+# DiabDuration    1   907.68 927.68 23.634 1.165e-06 ***
+# NewTG           1   915.35 935.35 31.308 2.201e-08 ***
+# NewHDL          1   912.93 932.93 28.885 7.680e-08 ***
+# OnSU            1   886.05 906.05  2.010  0.156216    
+# BasalBolus      1   922.08 942.08 38.039 6.934e-10 ***
+# NewHbA1C2       1   904.88 924.88 20.842 4.989e-06 ***
+# Creatinine      1   893.29 913.29  9.244  0.002363 ** 
+
+### drop AgeCpep
+modelb1.3 <- update(modelb1.2, ~.-AgeCpep)
+drop1(modelb1.3, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              884.13 904.13                     
+# sex             1   892.73 910.73  8.599 0.0033644 ** 
+# Calculated_BMI  1   901.35 919.35 17.216 3.336e-05 ***
+# DiabDuration    1   909.13 927.13 24.992 5.756e-07 ***
+# NewTG           1   915.43 933.43 31.295 2.217e-08 ***
+# NewHDL          1   912.93 930.93 28.796 8.043e-08 ***
+# OnSU            1   886.18 904.18  2.043 0.1528771    
+# BasalBolus      1   925.60 943.60 41.468 1.198e-10 ***
+# NewHbA1C2       1   906.67 924.67 22.533 2.066e-06 ***
+# Creatinine      1   895.22 913.22 11.089 0.0008684 ***
+
+### drop OnSU
+modelb1.4 <- update(modelb1.3, ~.-OnSU)
+drop1(modelb1.4, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              886.18 904.18                     
+# sex             1   894.49 910.49  8.318 0.0039248 ** 
+# Calculated_BMI  1   903.29 919.29 17.111 3.526e-05 ***
+# DiabDuration    1   912.65 928.65 26.469 2.678e-07 ***
+# NewTG           1   917.11 933.11 30.933 2.670e-08 ***
+# NewHDL          1   916.50 932.50 30.322 3.659e-08 ***
+# BasalBolus      1   928.17 944.17 41.996 9.145e-11 ***
+# NewHbA1C2       1   908.34 924.34 22.160 2.508e-06 ***
+# Creatinine      1   897.17 913.17 10.998 0.0009123 ***
+
+### all covariates are significant now
+summary(modelb1.4)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -0.364494   0.778976  -0.468  0.63985    
+# sexF            0.516655   0.180656   2.860  0.00424 ** 
+# Calculated_BMI  0.062061   0.015575   3.985 6.76e-05 ***
+# DiabDuration   -0.058403   0.011517  -5.071 3.95e-07 ***
+# NewTG           0.446253   0.095859   4.655 3.24e-06 ***
+# NewHDL         -1.178030   0.226235  -5.207 1.92e-07 ***
+# BasalBolusF     1.572962   0.245228   6.414 1.41e-10 ***
+# NewHbA1C2      -0.022023   0.004724  -4.662 3.13e-06 ***
+# Creatinine      0.009527   0.002997   3.179  0.00148 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  886.18  on 945  degrees of freedom
+# AIC: 904.18
+Anova(modelb1.4, type = 2)
+# Analysis of Deviance Table (Type II tests)
+# 
+# Response: Cpep600
+#                LR Chisq Df Pr(>Chisq)    
+# sex               8.318  1  0.0039248 ** 
+# Calculated_BMI   17.111  1  3.526e-05 ***
+# DiabDuration     26.469  1  2.678e-07 ***
+# NewTG            30.933  1  2.670e-08 ***
+# NewHDL           30.322  1  3.659e-08 ***
+# BasalBolus       41.996  1  9.145e-11 ***
+# NewHbA1C2        22.160  1  2.508e-06 ***
+# Creatinine       10.998  1  0.0009123 ***
+
+### compare modela1.4 (MSM with 9 covariates) with modelb1.4 (MSM with 8 covariates - without Time to Insulin) using analysis of deviance
+anova(modela1.4, modelb1.4, test="Chisq")
+# Analysis of Deviance Table
+# 
+# Model 1: Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine
+# Model 2: Cpep600 ~ sex + Calculated_BMI + DiabDuration + NewTG + NewHDL + 
+#     BasalBolus + NewHbA1C2 + Creatinine
+#   Resid. Df Resid. Dev Df Deviance  Pr(>Chi)    
+# 1       944     860.07                          
+# 2       945     886.18 -1   -26.11 3.225e-07 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+```
+
+```{r}
+### MODEL C - without DiabDuration
+```
+```{r}
+df_modelc <- main12_trainlog[,c("sex", "AgeCpep", "Cpep600", "Calculated_BMI", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL", "OnSU", "BasalBolus", "NewHbA1C2", "Creatinine")]
+
+### modelc1 - without polynomial or transformation of covariates
+### build maximal model then use backward elimination for MSM
+modelc1.1 <- glm(Cpep600~., data=df_modelc, family="binomial")
+drop1(modelc1.1, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              906.66 930.66                     
+# sex             1   915.06 937.06  8.405  0.003741 ** 
+# AgeCpep         1   907.49 929.49  0.832  0.361593    
+# Calculated_BMI  1   924.43 946.43 17.773 2.489e-05 ***
+# TimeToInsulin   1   907.63 929.63  0.970  0.324749    
+# NewALT2         1   906.71 928.71  0.055  0.814490    
+# NewTG           1   940.19 962.19 33.528 7.026e-09 ***
+# NewHDL          1   934.83 956.83 28.173 1.109e-07 ***
+# OnSU            1   909.99 931.99  3.334  0.067856 .  
+# BasalBolus      1   949.75 971.75 43.092 5.223e-11 ***
+# NewHbA1C2       1   934.43 956.43 27.772 1.365e-07 ***
+# Creatinine      1   913.54 935.54  6.878  0.008728 ** 
+
+### drop NewALT2
+modelc1.2 <- update(modelc1.1, ~.-NewALT2)
+drop1(modelc1.2, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              906.71 928.71                     
+# sex             1   915.08 935.08  8.362  0.003831 ** 
+# AgeCpep         1   907.64 927.64  0.924  0.336396    
+# Calculated_BMI  1   924.57 944.57 17.860 2.378e-05 ***
+# TimeToInsulin   1   907.68 927.68  0.963  0.326529    
+# NewTG           1   940.59 960.59 33.871 5.891e-09 ***
+# NewHDL          1   935.03 955.03 28.320 1.028e-07 ***
+# OnSU            1   910.17 930.17  3.452  0.063178 .  
+# BasalBolus      1   949.87 969.87 43.159 5.046e-11 ***
+# NewHbA1C2       1   934.60 954.60 27.883 1.289e-07 ***
+# Creatinine      1   913.54 933.54  6.823  0.009001 ** 
+
+### drop AgeCpep
+modelc1.3 <- update(modelc1.2, ~.-AgeCpep)
+drop1(modelc1.3, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              907.64 927.64                     
+# sex             1   915.51 933.51  7.871  0.005023 ** 
+# Calculated_BMI  1   926.97 944.97 19.333 1.098e-05 ***
+# TimeToInsulin   1   909.13 927.13  1.487  0.222711    
+# NewTG           1   943.06 961.06 35.418 2.661e-09 ***
+# NewHDL          1   936.83 954.83 29.191 6.557e-08 ***
+# OnSU            1   911.06 929.06  3.419  0.064442 .  
+# BasalBolus      1   950.13 968.13 42.489 7.109e-11 ***
+# NewHbA1C2       1   934.61 952.61 26.968 2.068e-07 ***
+# Creatinine      1   913.54 931.54  5.899  0.015152 *  
+
+### drop TimeToInsulin - SLIGHTLY DIFFERENT FROM OTHER MODELS
+modelc1.4 <- update(modelc1.3, ~.-TimeToInsulin)
+drop1(modelc1.4, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              909.13 927.13                     
+# sex             1   917.16 933.16  8.031  0.004599 ** 
+# Calculated_BMI  1   928.89 944.89 19.763 8.765e-06 ***
+# NewTG           1   945.44 961.44 36.311 1.682e-09 ***
+# NewHDL          1   937.86 953.86 28.739 8.281e-08 ***
+# OnSU            1   912.65 928.65  3.520  0.060639 .  
+# BasalBolus      1   950.63 966.63 41.501 1.178e-10 ***
+# NewHbA1C2       1   936.47 952.47 27.341 1.706e-07 ***
+# Creatinine      1   914.32 930.32  5.191  0.022706 *  
+
+### p value for OnSU is borderline
+### drop OnSU 
+modelc1.5 <- update(modelc1.4, ~.-OnSU)
+drop1(modelc1.5, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              912.65 928.65                     
+# sex             1   920.24 934.24  7.590  0.005869 ** 
+# Calculated_BMI  1   932.37 946.37 19.728 8.931e-06 ***
+# NewTG           1   948.57 962.57 35.921 2.055e-09 ***
+# NewHDL          1   943.48 957.48 30.833 2.813e-08 ***
+# BasalBolus      1   954.86 968.86 42.216 8.172e-11 ***
+# NewHbA1C2       1   939.73 953.73 27.088 1.944e-07 ***
+# Creatinine      1   917.57 931.57  4.922  0.026514 * 
+
+### all covariates are significant now
+summary(modelc1.5)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -0.889297   0.766719  -1.160  0.24610    
+# sexF            0.485330   0.177541   2.734  0.00626 ** 
+# Calculated_BMI  0.064759   0.015273   4.240 2.24e-05 ***
+# NewTG           0.474095   0.095171   4.981 6.31e-07 ***
+# NewHDL         -1.179036   0.224315  -5.256 1.47e-07 ***
+# BasalBolusF     1.560101   0.242052   6.445 1.15e-10 ***
+# NewHbA1C2      -0.023893   0.004645  -5.144 2.69e-07 ***
+# Creatinine      0.006079   0.002814   2.161  0.03073 *  
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  912.65  on 946  degrees of freedom
+# AIC: 928.65
+
+### compare modela1.4 (MSM of 12 covariates) and modelc1.4 (MSM of 11 covariates - excluding DiabDuration)
+anova(modela1.4, modelc1.4, test="Chisq")
+# Analysis of Deviance Table
+# 
+# Model 1: Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine
+# Model 2: Cpep600 ~ sex + Calculated_BMI + NewTG + NewHDL + OnSU + BasalBolus + 
+#     NewHbA1C2 + Creatinine
+#   Resid. Df Resid. Dev Df Deviance  Pr(>Chi)    
+# 1       944     860.07                          
+# 2       945     909.13 -1  -49.059 2.484e-12 ***
+
+### modela1.4 is better than modelc1.4
+```
+
+```{r}
+### modela2 - including Polynomial terms for continuous covariates
+```
+```{r}
+modela2.1 <- with(df_modela, glm(Cpep600 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + Creatinine + I(AgeCpep^2) + I(Calculated_BMI^2) + I(DiabDuration^2) + I(TimeToInsulin^2) + I(NewTG^2) + I(NewHDL^2) + I(NewHbA1C2^2) + I(Creatinine^2), family = "binomial"))
+summary(modela2.1)
+#                       Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)          1.040e+00  3.231e+00   0.322  0.74745    
+# sexF                 5.820e-01  1.948e-01   2.987  0.00282 ** 
+# AgeCpep             -6.134e-02  7.953e-02  -0.771  0.44054    
+# Calculated_BMI       1.343e-01  9.985e-02   1.345  0.17859    
+# DiabDuration        -1.301e-01  5.471e-02  -2.378  0.01743 *  
+# TimeToInsulin        1.049e-01  5.497e-02   1.908  0.05638 .  
+# NewTG                7.640e-01  1.569e-01   4.869 1.12e-06 ***
+# NewHDL              -1.387e+00  9.719e-01  -1.427  0.15352    
+# OnSUF               -4.636e-01  5.423e-01  -0.855  0.39265    
+# BasalBolusF          1.425e+00  2.660e-01   5.357 8.45e-08 ***
+# NewHbA1C2           -3.983e-02  2.942e-02  -1.354  0.17589    
+# Creatinine           1.099e-02  1.186e-02   0.926  0.35453    
+# I(AgeCpep^2)         5.215e-04  6.122e-04   0.852  0.39426    
+# I(Calculated_BMI^2) -1.141e-03  1.466e-03  -0.778  0.43650    
+# I(DiabDuration^2)   -4.102e-04  1.474e-03  -0.278  0.78078    
+# I(TimeToInsulin^2)   7.346e-04  2.095e-03   0.351  0.72583    
+# I(NewTG^2)          -3.972e-02  1.286e-02  -3.089  0.00201 ** 
+# I(NewHDL^2)          1.056e-01  2.797e-01   0.378  0.70573    
+# I(NewHbA1C2^2)       1.264e-04  1.914e-04   0.661  0.50888    
+# I(Creatinine^2)     -3.011e-06  4.685e-05  -0.064  0.94875    
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  850.67  on 934  degrees of freedom
+# AIC: 890.67
+drop1(modela2.1, test="Chisq")
+#                     Df Deviance    AIC     LRT  Pr(>Chi)    
+# <none>                   850.67 890.67                      
+# sex                  1   859.74 897.74  9.0744  0.002592 ** 
+# AgeCpep              1   851.27 889.27  0.6039  0.437078    
+# Calculated_BMI       1   852.31 890.31  1.6434  0.199857    
+# DiabDuration         1   856.19 894.19  5.5215  0.018784 *  
+# TimeToInsulin        1   854.17 892.17  3.5074  0.061095 .  
+# NewTG                1   872.33 910.33 21.6676 3.242e-06 ***
+# NewHDL               1   852.51 890.51  1.8417  0.174755    
+# OnSU                 1   851.45 889.45  0.7871  0.374979    
+# BasalBolus           1   879.79 917.79 29.1211 6.799e-08 ***
+# NewHbA1C2            1   852.55 890.55  1.8843  0.169843    
+# Creatinine           1   851.49 889.49  0.8202  0.365131    
+# I(AgeCpep^2)         1   851.40 889.40  0.7376  0.390417    
+# I(Calculated_BMI^2)  1   851.23 889.23  0.5621  0.453406    
+# I(DiabDuration^2)    1   850.74 888.74  0.0781  0.779952    
+# I(TimeToInsulin^2)   1   850.79 888.79  0.1249  0.723825    
+# I(NewTG^2)           1   857.15 895.15  6.4892  0.010853 *  
+# I(NewHDL^2)          1   850.80 888.80  0.1364  0.711869    
+# I(NewHbA1C2^2)       1   851.11 889.11  0.4424  0.505969    
+# I(Creatinine^2)      1   850.67 888.67  0.0041  0.948894  
+
+### drop I(Creatinine^2)
+modela2.2 <- update(modela2.1, ~.-I(Creatinine^2))
+drop1(modela2.2, test = "Chisq")
+#                     Df Deviance    AIC     LRT  Pr(>Chi)    
+# <none>                   850.67 888.67                      
+# sex                  1   860.05 896.05  9.3780  0.002196 ** 
+# AgeCpep              1   851.27 887.27  0.5999  0.438621    
+# Calculated_BMI       1   852.32 888.32  1.6548  0.198305    
+# DiabDuration         1   856.19 892.19  5.5174  0.018828 *  
+# TimeToInsulin        1   854.17 890.17  3.5036  0.061236 .  
+# NewTG                1   872.35 908.35 21.6805 3.221e-06 ***
+# NewHDL               1   852.51 888.51  1.8388  0.175096    
+# OnSU                 1   851.46 887.46  0.7867  0.375104    
+# BasalBolus           1   880.09 916.09 29.4211 5.824e-08 ***
+# NewHbA1C2            1   852.55 888.55  1.8804  0.170289    
+# Creatinine           1   860.82 896.82 10.1496  0.001443 ** 
+# I(AgeCpep^2)         1   851.40 887.40  0.7339  0.391608    
+# I(Calculated_BMI^2)  1   851.24 887.24  0.5658  0.451931    
+# I(DiabDuration^2)    1   850.75 886.75  0.0786  0.779215    
+# I(TimeToInsulin^2)   1   850.80 886.80  0.1258  0.722837    
+# I(NewTG^2)           1   857.16 893.16  6.4885  0.010857 *  
+# I(NewHDL^2)          1   850.81 886.81  0.1359  0.712354    
+# I(NewHbA1C2^2)       1   851.11 887.11  0.4394  0.507417   
+
+### drop I(DiabDuration^2)
+modela2.3 <- update(modela2.2, ~.-I(DiabDuration^2))
+drop1(modela2.3, test = "Chisq")
+#                     Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>                   850.75 886.75                     
+# sex                  1   860.18 894.18  9.427  0.002138 ** 
+# AgeCpep              1   851.32 885.32  0.569  0.450629    
+# Calculated_BMI       1   852.48 886.48  1.728  0.188615    
+# DiabDuration         1   897.82 931.82 47.073 6.840e-12 ***
+# TimeToInsulin        1   857.54 891.54  6.797  0.009133 ** 
+# NewTG                1   872.35 906.35 21.603 3.353e-06 ***
+# NewHDL               1   852.65 886.65  1.901  0.167976    
+# OnSU                 1   851.51 885.51  0.764  0.382093    
+# BasalBolus           1   880.20 914.20 29.450 5.737e-08 ***
+# NewHbA1C2            1   852.64 886.64  1.896  0.168504    
+# Creatinine           1   860.91 894.91 10.164  0.001432 ** 
+# I(AgeCpep^2)         1   851.45 885.45  0.701  0.402444    
+# I(Calculated_BMI^2)  1   851.35 885.35  0.603  0.437307    
+# I(TimeToInsulin^2)   1   850.80 884.80  0.049  0.825076    
+# I(NewTG^2)           1   857.17 891.17  6.424  0.011261 *  
+# I(NewHDL^2)          1   850.90 884.90  0.151  0.697185    
+# I(NewHbA1C2^2)       1   851.20 885.20  0.454  0.500544  
+
+### drop I(NewHDL^2)
+modela2.4 <- update(modela2.3, ~.-I(NewHDL^2))
+drop1(modela2.4, test = "Chisq")
+#                     Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>                   850.90 884.90                     
+# sex                  1   860.18 892.18  9.278  0.002319 ** 
+# AgeCpep              1   851.48 883.48  0.578  0.447218    
+# Calculated_BMI       1   852.61 884.61  1.712  0.190767    
+# DiabDuration         1   897.87 929.87 46.974 7.194e-12 ***
+# TimeToInsulin        1   857.60 889.60  6.703  0.009626 ** 
+# NewTG                1   872.85 904.85 21.955 2.792e-06 ***
+# NewHDL               1   871.42 903.42 20.517 5.912e-06 ***
+# OnSU                 1   851.70 883.70  0.798  0.371760    
+# BasalBolus           1   880.35 912.35 29.454 5.727e-08 ***
+# NewHbA1C2            1   852.83 884.83  1.926  0.165205    
+# Creatinine           1   861.15 893.15 10.255  0.001363 ** 
+# I(AgeCpep^2)         1   851.60 883.60  0.705  0.401067    
+# I(Calculated_BMI^2)  1   851.50 883.50  0.597  0.439666    
+# I(TimeToInsulin^2)   1   850.95 882.95  0.051  0.820887    
+# I(NewTG^2)           1   857.39 889.39  6.487  0.010866 *  
+# I(NewHbA1C2^2)       1   851.37 883.37  0.474  0.491070 
+
+### drop I(TimeToInsulin^2)
+modela2.5 <- update(modela2.4, ~.-I(TimeToInsulin^2))
+drop1(modela2.5, test = "Chisq")
+#                     Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>                   850.95 882.95                     
+# sex                  1   860.19 890.19  9.244  0.002363 ** 
+# AgeCpep              1   851.54 881.54  0.589  0.442692    
+# Calculated_BMI       1   852.61 882.61  1.660  0.197545    
+# DiabDuration         1   897.88 927.88 46.930 7.357e-12 ***
+# TimeToInsulin        1   875.39 905.39 24.438 7.676e-07 ***
+# NewTG                1   872.88 902.88 21.926 2.834e-06 ***
+# NewHDL               1   871.47 901.47 20.515 5.918e-06 ***
+# OnSU                 1   851.76 881.76  0.809  0.368451    
+# BasalBolus           1   880.36 910.36 29.411 5.854e-08 ***
+# NewHbA1C2            1   852.98 882.98  2.034  0.153823    
+# Creatinine           1   861.16 891.16 10.205  0.001400 ** 
+# I(AgeCpep^2)         1   851.67 881.67  0.715  0.397758    
+# I(Calculated_BMI^2)  1   851.51 881.51  0.554  0.456501    
+# I(NewTG^2)           1   857.43 887.43  6.477  0.010927 *  
+# I(NewHbA1C2^2)       1   851.47 881.47  0.515  0.473174 
+
+### drop I(NewHbA1C2^2) 
+modela2.6 <- update(modela2.5, ~.-I(NewHbA1C2^2))
+drop1(modela2.6, test = "Chisq")
+#                     Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>                   851.47 881.47                     
+# sex                  1   860.83 888.83  9.367  0.002209 ** 
+# AgeCpep              1   852.10 880.10  0.639  0.424116    
+# Calculated_BMI       1   852.96 880.96  1.497  0.221168    
+# DiabDuration         1   898.49 926.49 47.029 6.993e-12 ***
+# TimeToInsulin        1   876.04 904.04 24.573 7.156e-07 ***
+# NewTG                1   873.33 901.33 21.866 2.924e-06 ***
+# NewHDL               1   872.37 900.37 20.901 4.838e-06 ***
+# OnSU                 1   852.24 880.24  0.774  0.379130    
+# BasalBolus           1   881.39 909.39 29.928 4.484e-08 ***
+# NewHbA1C2            1   868.77 896.77 17.307 3.180e-05 ***
+# Creatinine           1   861.50 889.50 10.038  0.001533 ** 
+# I(AgeCpep^2)         1   852.23 880.23  0.766  0.381399    
+# I(Calculated_BMI^2)  1   851.91 879.91  0.445  0.504830    
+# I(NewTG^2)           1   857.80 885.80  6.339  0.011812 *  
+
+### drop I(Calculated_BMI^2) 
+modela2.7 <- update(modela2.6, ~.-I(Calculated_BMI^2))
+drop1(modela2.7, test = "Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              851.91 879.91                     
+# sex             1   861.07 887.07  9.160 0.0024735 ** 
+# AgeCpep         1   852.54 878.54  0.625 0.4290983    
+# Calculated_BMI  1   866.31 892.31 14.403 0.0001476 ***
+# DiabDuration    1   898.65 924.65 46.744 8.087e-12 ***
+# TimeToInsulin   1   876.21 902.21 24.302 8.235e-07 ***
+# NewTG           1   874.60 900.60 22.687 1.906e-06 ***
+# NewHDL          1   873.00 899.00 21.088 4.387e-06 ***
+# OnSU            1   852.62 878.62  0.712 0.3987080    
+# BasalBolus      1   881.82 907.82 29.913 4.520e-08 ***
+# NewHbA1C2       1   869.46 895.46 17.552 2.796e-05 ***
+# Creatinine      1   861.88 887.88  9.975 0.0015869 ** 
+# I(AgeCpep^2)    1   852.66 878.66  0.754 0.3851058    
+# I(NewTG^2)      1   858.49 884.49  6.580 0.0103155 * 
+
+### drop AgeCpep
+modela2.8 <- update(modela2.7, ~.-AgeCpep)
+drop1(modela2.8, test = "Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              852.54 878.54                     
+# sex             1   861.79 885.79  9.253 0.0023514 ** 
+# Calculated_BMI  1   866.56 890.56 14.025 0.0001804 ***
+# DiabDuration    1   899.13 923.13 46.599 8.710e-12 ***
+# TimeToInsulin   1   876.62 900.62 24.088 9.205e-07 ***
+# NewTG           1   874.85 898.85 22.319 2.309e-06 ***
+# NewHDL          1   873.64 897.64 21.110 4.338e-06 ***
+# OnSU            1   853.27 877.27  0.733 0.3917888    
+# BasalBolus      1   881.87 905.87 29.338 6.080e-08 ***
+# NewHbA1C2       1   869.56 893.56 17.025 3.690e-05 ***
+# Creatinine      1   862.62 886.62 10.087 0.0014934 ** 
+# I(AgeCpep^2)    1   852.96 876.96  0.422 0.5160743   
+
+### drop I(AgeCpep^2) 
+modela2.9 <- update(modela2.8, ~.-I(AgeCpep^2))
+drop1(modela2.9, test = "Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              852.96 876.96                     
+# sex             1   862.71 884.71  9.758 0.0017855 ** 
+# Calculated_BMI  1   866.60 888.60 13.648 0.0002205 ***
+# DiabDuration    1   899.88 921.88 46.924 7.378e-12 ***
+# TimeToInsulin   1   876.78 898.78 23.820 1.058e-06 ***
+# NewTG           1   875.03 897.03 22.072 2.626e-06 ***
+# NewHDL          1   873.76 895.76 20.798 5.103e-06 ***
+# OnSU            1   853.73 875.73  0.771 0.3797805    
+# BasalBolus      1   886.09 908.09 33.133 8.607e-09 ***
+# NewHbA1C2       1   871.94 893.94 18.979 1.322e-05 ***
+# Creatinine      1   865.88 887.88 12.920 0.0003250 ***
+# I(NewTG^2)      1   859.24 881.24  6.282 0.0122005 *  
+
+### drop OnSU
+modela2.10 <- update(modela2.9, ~.-OnSU)
+drop1(modela2.10, test = "Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              853.73 875.73                     
+# sex             1   863.33 883.33  9.604 0.0019421 ** 
+# Calculated_BMI  1   867.37 887.37 13.643 0.0002211 ***
+# DiabDuration    1   903.09 923.09 49.360 2.130e-12 ***
+# TimeToInsulin   1   878.69 898.69 24.961 5.850e-07 ***
+# NewTG           1   875.86 895.86 22.128 2.551e-06 ***
+# NewHDL          1   875.33 895.33 21.600 3.359e-06 ***
+# BasalBolus      1   886.99 906.99 33.260 8.063e-09 ***
+# NewHbA1C2       1   872.47 892.47 18.745 1.494e-05 ***
+# Creatinine      1   866.64 886.64 12.907 0.0003273 ***
+# I(NewTG^2)      1   860.07 880.07  6.338 0.0118168 *  
+
+### all remaining terms are significant. Both NewTG and I(NewTG^2) remains (?does this mean it is inkeeping with the linearity plot)
+summary(modela2.10)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -0.809113   0.810085  -0.999 0.317891    
+# sexF            0.574330   0.187144   3.069 0.002148 ** 
+# Calculated_BMI  0.056427   0.015835   3.563 0.000366 ***
+# DiabDuration   -0.141401   0.021000  -6.733 1.66e-11 ***
+# TimeToInsulin   0.121169   0.024911   4.864 1.15e-06 ***
+# NewTG           0.764717   0.155364   4.922 8.56e-07 ***
+# NewHDL         -1.048432   0.234782  -4.466 7.99e-06 ***
+# BasalBolusF     1.457724   0.253687   5.746 9.13e-09 ***
+# NewHbA1C2      -0.020745   0.004834  -4.292 1.77e-05 ***
+# Creatinine      0.010808   0.003159   3.422 0.000622 ***
+# I(NewTG^2)     -0.039166   0.012862  -3.045 0.002326 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  853.73  on 943  degrees of freedom
+# AIC: 875.73
+
+### compare MSM modela2.10 with MSM modela1.4
+anova(modela1.4, modela2.10, test = "Chisq")
+# Analysis of Deviance Table
+# 
+# Model 1: Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine
+# Model 2: Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine + I(NewTG^2)
+#   Resid. Df Resid. Dev Df Deviance Pr(>Chi)  
+# 1       944     860.07                       
+# 2       943     853.73  1   6.3381  0.01182 *
+
+### This shows that modela2.10 has less residual deviance and is preferred
+```
+
+```{r}
+### modela3 - use 'mfp' (multivariable fractional polynomial) package to select optimal non linear transformation for continuous variable
+```
+```{r}
+mfpmodel<- mfp(factor(Cpep600)~sex + fp(AgeCpep) + fp(Calculated_BMI) + fp(DiabDuration) + fp(TimeToInsulin) + fp(NewALT2) + fp(NewTG) + fp(NewHDL) + OnSU + BasalBolus + fp(NewHbA1C2) + fp(Creatinine), data=df_modela, family= binomial)
+mfpmodel
+# Deviance table:
+#  		 Resid. Dev
+# Null model	 1133.013
+# Linear model	 858.9302
+# Final model	 843.584
+# 
+# Fractional polynomials:
+#                df.initial select alpha df.final power1 power2
+# DiabDuration            4      1  0.05        1      1      .
+# NewTG                   4      1  0.05        2   -0.5      .
+# BasalBolusF             1      1  0.05        1      1      .
+# NewHDL                  4      1  0.05        1      1      .
+# TimeToInsulin           4      1  0.05        1      1      .
+# NewHbA1C2               4      1  0.05        1      1      .
+# Calculated_BMI          4      1  0.05        1      1      .
+# sexF                    1      1  0.05        1      1      .
+# Creatinine              4      1  0.05        1      1      .
+# OnSUF                   1      1  0.05        1      1      .
+# AgeCpep                 4      1  0.05        1      1      .
+# NewALT2                 4      1  0.05        1      1      .
+# 
+# 
+# Transformations of covariates:
+#                                    formula
+# sex                                    sex
+# AgeCpep                 I((AgeCpep/100)^1)
+# Calculated_BMI   I((Calculated_BMI/100)^1)
+# DiabDuration        I((DiabDuration/10)^1)
+# TimeToInsulin  I(((TimeToInsulin+1)/10)^1)
+# NewALT2                  I((NewALT2/10)^1)
+# NewTG                        I(NewTG^-0.5)
+# NewHDL                         I(NewHDL^1)
+# OnSU                                  OnSU
+# BasalBolus                      BasalBolus
+# NewHbA1C2             I((NewHbA1C2/100)^1)
+# Creatinine           I((Creatinine/100)^1)
+# 
+# Coefficients:
+#        Intercept    DiabDuration.1           NewTG.1     BasalBolusF.1          NewHDL.1   TimeToInsulin.1       NewHbA1C2.1  
+#         3.094131         -1.426545         -3.345839          1.425493         -0.913735          1.211734         -2.041228  
+# Calculated_BMI.1            sexF.1      Creatinine.1           OnSUF.1         AgeCpep.1         NewALT2.1  
+#         5.339391          0.525693          1.031460         -0.381844          0.391435          0.006099  
+# 
+# Degrees of Freedom: 953 Total (i.e. Null);  941 Residual
+# Null Deviance:	    1133 
+# Residual Deviance: 843.6 	AIC: 869.6 
+
+### Non linear transformation chosen for NewTG only (df final = 2). I(NewTG^-0.5) - negative fraction exponent
+### 
+modela3.1 <- with(df_modela, glm(Cpep600 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewALT2 + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + Creatinine + I(NewTG^-0.5), family = "binomial"))
+summary(modela3.1)
+# Coefficients:
+#                  Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)     2.8989709  1.3895182   2.086 0.036950 *  
+# sexF            0.5297398  0.1905103   2.781 0.005425 ** 
+# AgeCpep         0.0043459  0.0103160   0.421 0.673553    
+# Calculated_BMI  0.0537082  0.0160768   3.341 0.000836 ***
+# DiabDuration   -0.1429898  0.0217906  -6.562 5.31e-11 ***
+# TimeToInsulin   0.1216155  0.0252722   4.812 1.49e-06 ***
+# NewALT2         0.0005607  0.0057363   0.098 0.922127    
+# NewTG           0.0490714  0.1061063   0.462 0.643741    
+# NewHDL         -0.9163907  0.2403649  -3.812 0.000138 ***
+# OnSUF          -0.3922284  0.5430532  -0.722 0.470131    
+# BasalBolusF     1.4293222  0.2620457   5.454 4.91e-08 ***
+# NewHbA1C2      -0.0206172  0.0049703  -4.148 3.35e-05 ***
+# Creatinine      0.0102910  0.0033402   3.081 0.002063 ** 
+# I(NewTG^-0.5)  -3.0831604  0.7548451  -4.084 4.42e-05 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  843.36  on 940  degrees of freedom
+# AIC: 871.36
+
+drop1(modela3.1, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              843.36 871.36                     
+# sex             1   851.21 877.21  7.853 0.0050735 ** 
+# AgeCpep         1   843.54 869.54  0.177 0.6737212    
+# Calculated_BMI  1   855.28 881.28 11.919 0.0005557 ***
+# DiabDuration    1   889.92 915.92 46.556 8.903e-12 ***
+# TimeToInsulin   1   867.74 893.74 24.383 7.898e-07 ***
+# NewALT2         1   843.37 869.37  0.010 0.9220201    
+# NewTG           1   843.58 869.58  0.223 0.6365664    
+# NewHDL          1   858.75 884.75 15.386 8.763e-05 ***
+# OnSU            1   843.92 869.92  0.556 0.4557757    
+# BasalBolus      1   873.27 899.27 29.911 4.523e-08 ***
+# NewHbA1C2       1   860.87 886.87 17.509 2.859e-05 ***
+# Creatinine      1   853.73 879.73 10.365 0.0012844 ** 
+# I(NewTG^-0.5)   1   858.93 884.93 15.569 7.953e-05 ***
+
+### drop NewALT2
+modela3.2 <- update(modela3.1, ~.-NewALT2)
+drop1(modela3.2, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              843.37 869.37                     
+# sex             1   851.25 875.25  7.883 0.0049915 ** 
+# AgeCpep         1   843.54 867.54  0.169 0.6812832    
+# Calculated_BMI  1   855.35 879.35 11.975 0.0005391 ***
+# DiabDuration    1   889.98 913.98 46.612 8.652e-12 ***
+# TimeToInsulin   1   867.81 891.81 24.441 7.660e-07 ***
+# NewTG           1   843.60 867.60  0.225 0.6352530    
+# NewHDL          1   858.83 882.83 15.456 8.444e-05 ***
+# OnSU            1   843.94 867.94  0.572 0.4496296    
+# BasalBolus      1   873.30 897.30 29.932 4.474e-08 ***
+# NewHbA1C2       1   860.95 884.95 17.582 2.752e-05 ***
+# Creatinine      1   853.75 877.75 10.380 0.0012740 ** 
+# I(NewTG^-0.5)   1   858.94 882.94 15.567 7.962e-05 ***
+
+### drop AgeCpep
+modela3.3 <- update(modela3.2, ~.-AgeCpep)
+drop1(modela3.3, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              843.54 867.54                     
+# sex             1   851.72 873.72  8.180 0.0042365 ** 
+# Calculated_BMI  1   855.35 877.35 11.808 0.0005899 ***
+# DiabDuration    1   891.13 913.13 47.595 5.240e-12 ***
+# TimeToInsulin   1   867.84 889.84 24.306 8.219e-07 ***
+# NewTG           1   843.73 865.73  0.192 0.6612549    
+# NewHDL          1   858.84 880.84 15.297 9.185e-05 ***
+# OnSU            1   844.13 866.13  0.590 0.4425452    
+# BasalBolus      1   876.89 898.89 33.349 7.702e-09 ***
+# NewHbA1C2       1   862.87 884.87 19.329 1.100e-05 ***
+# Creatinine      1   856.10 878.10 12.560 0.0003941 ***
+# I(NewTG^-0.5)   1   859.24 881.24 15.699 7.425e-05 ***
+
+### drop NewTG
+modela3.4 <- update(modela3.3, ~.-NewTG)
+drop1(modela3.4, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              843.73 865.73                     
+# sex             1   851.80 871.80  8.068 0.0045057 ** 
+# Calculated_BMI  1   855.46 875.46 11.729 0.0006152 ***
+# DiabDuration    1   891.32 911.32 47.591 5.250e-12 ***
+# TimeToInsulin   1   867.94 887.94 24.205 8.660e-07 ***
+# NewHDL          1   858.96 878.96 15.229 9.522e-05 ***
+# OnSU            1   844.29 864.29  0.561 0.4536757    
+# BasalBolus      1   876.94 896.94 33.205 8.293e-09 ***
+# NewHbA1C2       1   862.87 882.87 19.137 1.216e-05 ***
+# Creatinine      1   856.27 876.27 12.541 0.0003981 ***
+# I(NewTG^-0.5)   1   890.35 910.35 46.620 8.617e-12 ***
+
+### drop OnSU
+modela3.5 <- update(modela3.4, ~.-OnSU)
+drop1(modela3.5, test="Chisq")
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              844.29 864.29                     
+# sex             1   852.24 870.24  7.952 0.0048028 ** 
+# Calculated_BMI  1   856.04 874.04 11.749 0.0006087 ***
+# DiabDuration    1   894.02 912.02 49.725 1.769e-12 ***
+# TimeToInsulin   1   869.53 887.53 25.235 5.075e-07 ***
+# NewHDL          1   860.07 878.07 15.781 7.113e-05 ***
+# BasalBolus      1   877.63 895.63 33.337 7.749e-09 ***
+# NewHbA1C2       1   863.27 881.27 18.974 1.325e-05 ***
+# Creatinine      1   856.81 874.81 12.515 0.0004037 ***
+# I(NewTG^-0.5)   1   890.95 908.95 46.662 8.434e-12 ***
+
+modela3.5 <- with(df_modela, glm(Cpep600 ~ sex + Calculated_BMI + DiabDuration + TimeToInsulin + NewHDL + BasalBolus + NewHbA1C2 + Creatinine + I(NewTG^-0.5), family = "binomial"))
+summary(modela3.5)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)     3.098903   0.893764   3.467 0.000526 ***
+# sexF            0.526537   0.188174   2.798 0.005140 ** 
+# Calculated_BMI  0.052714   0.015884   3.319 0.000905 ***
+# DiabDuration   -0.142997   0.021112  -6.773 1.26e-11 ***
+# TimeToInsulin   0.122826   0.025088   4.896 9.79e-07 ***
+# NewHDL         -0.921086   0.238280  -3.866 0.000111 ***
+# BasalBolusF     1.456188   0.251748   5.784 7.28e-09 ***
+# NewHbA1C2      -0.020772   0.004805  -4.323 1.54e-05 ***
+# Creatinine      0.010675   0.003175   3.362 0.000773 ***
+# I(NewTG^-0.5)  -3.332908   0.503443  -6.620 3.59e-11 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  844.29  on 944  degrees of freedom
+# AIC: 864.29
+
+Anova(modela3.5, type="2")
+# Analysis of Deviance Table (Type II tests)
+# 
+# Response: Cpep600
+#                LR Chisq Df Pr(>Chisq)    
+# sex               7.952  1  0.0048028 **  9
+# Calculated_BMI   11.749  1  0.0006087 *** 8 
+# DiabDuration     49.725  1  1.769e-12 *** 1
+# TimeToInsulin    25.235  1  5.075e-07 *** 4
+# NewHDL           15.781  1  7.113e-05 *** 6
+# BasalBolus       33.337  1  7.749e-09 *** 3
+# NewHbA1C2        18.974  1  1.325e-05 *** 5
+# Creatinine       12.515  1  0.0004037 *** 7
+# I(NewTG^-0.5)    46.662  1  8.434e-12 *** 2
+```
+
+```{r}
+### modelg1 - predictors from modela3.5 built using stepwise 
+```
+```{r}
+df_modelg <- main12_trainlog[,c("sex", "AgeCpep", "Cpep600", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL", "OnSU", "BasalBolus", "NewHbA1C2", "Creatinine")]
+
+### modelg1 - forward stepwise regression performed manually based on predictors from modela3.5(TG^-0.5)
+### start with most significant predictor in modela3.5 based on Analysis of Deviance (Type 2 test) table which is DiabDuration
+modelg1.1 <- glm(Cpep600~DiabDuration, data=df_modelg, family="binomial")
+summary(modelg1.1)
+# Coefficients:
+#              Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)   1.82322    0.17011  10.718  < 2e-16 ***
+# DiabDuration -0.06053    0.01016  -5.959 2.54e-09 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133  on 953  degrees of freedom
+# Residual deviance: 1096  on 952  degrees of freedom
+# AIC: 1100
+
+### next, add I(NewTG^-0.5)
+modelg1.2 <- update(modelg1.1, ~.+I(NewTG^-0.5))
+summary(modelg1.2)
+# Coefficients:
+#               Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    4.73522    0.36617  12.932  < 2e-16 ***
+# DiabDuration  -0.05275    0.01049  -5.027 4.99e-07 ***
+# I(NewTG^-0.5) -3.85853    0.39872  -9.677  < 2e-16 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  986.21  on 951  degrees of freedom
+# AIC: 992.21
+
+### next, add BasalBolus
+modelg1.3 <- update(modelg1.2, ~.+BasalBolus)
+summary(modelg1.3)
+# Coefficients:
+#               Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    3.63090    0.39475   9.198  < 2e-16 ***
+# DiabDuration  -0.05446    0.01073  -5.075 3.88e-07 ***
+# I(NewTG^-0.5) -4.10643    0.41463  -9.904  < 2e-16 ***
+# BasalBolusF    1.53164    0.23356   6.558 5.46e-11 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  942.99  on 950  degrees of freedom
+# AIC: 950.99
+
+### next, add TimeToInsulin
+modelg1.4 <- update(modelg1.3, ~.+TimeToInsulin)
+summary(modelg1.4)
+# Coefficients:
+#               Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    3.82171    0.40495   9.437  < 2e-16 ***
+# DiabDuration  -0.13795    0.01964  -7.022 2.18e-12 ***
+# I(NewTG^-0.5) -4.10396    0.42264  -9.710  < 2e-16 ***
+# BasalBolusF    1.42464    0.24076   5.917 3.27e-09 ***
+# TimeToInsulin  0.12355    0.02382   5.187 2.14e-07 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  914.63  on 949  degrees of freedom
+# AIC: 924.63
+
+### next, add NewHbA1C2
+modelg1.5 <- update(modelg1.4, ~.+NewHbA1C2)
+summary(modelg1.5)
+# Coefficients:
+#                Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    5.742915   0.587557   9.774  < 2e-16 ***
+# DiabDuration  -0.132012   0.019897  -6.635 3.25e-11 ***
+# I(NewTG^-0.5) -4.593821   0.448518 -10.242  < 2e-16 ***
+# BasalBolusF    1.426999   0.242926   5.874 4.25e-09 ***
+# TimeToInsulin  0.117350   0.023918   4.906 9.28e-07 ***
+# NewHbA1C2     -0.022400   0.004577  -4.894 9.89e-07 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.0  on 953  degrees of freedom
+# Residual deviance:  890.3  on 948  degrees of freedom
+# AIC: 902.3
+
+### next, add NewHDL
+modelg1.6 <- update(modelg1.5, ~.+NewHDL)
+summary(modelg1.6)
+# Coefficients:
+#                Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    6.316404   0.621943  10.156  < 2e-16 ***
+# DiabDuration  -0.128390   0.020023  -6.412 1.43e-10 ***
+# I(NewTG^-0.5) -3.920344   0.485559  -8.074 6.81e-16 ***
+# BasalBolusF    1.467954   0.244680   5.999 1.98e-09 ***
+# TimeToInsulin  0.111924   0.024151   4.634 3.58e-06 ***
+# NewHbA1C2     -0.022525   0.004616  -4.880 1.06e-06 ***
+# NewHDL        -0.826215   0.226519  -3.647 0.000265 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.0  on 953  degrees of freedom
+# Residual deviance:  876.5  on 947  degrees of freedom
+# AIC: 890.5
+
+### next, add Creatinine
+modelg1.7 <- update(modelg1.6, ~.+Creatinine)
+summary(modelg1.7)
+# Coefficients:
+#                Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    5.519226   0.677567   8.146 3.77e-16 ***
+# DiabDuration  -0.139160   0.020594  -6.757 1.40e-11 ***
+# I(NewTG^-0.5) -3.895510   0.486442  -8.008 1.16e-15 ***
+# BasalBolusF    1.425859   0.246414   5.786 7.19e-09 ***
+# TimeToInsulin  0.115692   0.024322   4.757 1.97e-06 ***
+# NewHbA1C2     -0.020186   0.004681  -4.312 1.62e-05 ***
+# NewHDL        -0.808546   0.225733  -3.582 0.000341 ***
+# Creatinine     0.008082   0.002963   2.727 0.006384 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  868.46  on 946  degrees of freedom
+# AIC: 884.46
+
+### next, add Calculated_BMI
+modelg1.8 <- update(modelg1.7, ~.+Calculated_BMI)
+summary(modelg1.8)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)     3.255279   0.885966   3.674 0.000239 ***
+# DiabDuration   -0.136612   0.020740  -6.587 4.49e-11 ***
+# I(NewTG^-0.5)  -3.513681   0.497771  -7.059 1.68e-12 ***
+# BasalBolusF     1.481227   0.250706   5.908 3.46e-09 ***
+# TimeToInsulin   0.115669   0.024677   4.687 2.77e-06 ***
+# NewHbA1C2      -0.021511   0.004782  -4.499 6.84e-06 ***
+# NewHDL         -0.776840   0.228580  -3.399 0.000677 ***
+# Creatinine      0.008395   0.002985   2.812 0.004920 ** 
+# Calculated_BMI  0.060297   0.015600   3.865 0.000111 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  852.24  on 945  degrees of freedom
+# AIC: 870.24
+
+### next, add sex (last predictor)
+modelg1.9 <- update(modelg1.8, ~.+sex)
+summary(modelg1.9)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)     3.098903   0.893764   3.467 0.000526 ***
+# DiabDuration   -0.142997   0.021112  -6.773 1.26e-11 ***
+# I(NewTG^-0.5)  -3.332908   0.503443  -6.620 3.59e-11 ***
+# BasalBolusF     1.456188   0.251748   5.784 7.28e-09 ***
+# TimeToInsulin   0.122826   0.025088   4.896 9.79e-07 ***
+# NewHbA1C2      -0.020772   0.004805  -4.323 1.54e-05 ***
+# NewHDL         -0.921086   0.238280  -3.866 0.000111 ***
+# Creatinine      0.010675   0.003175   3.362 0.000773 ***
+# Calculated_BMI  0.052714   0.015884   3.319 0.000905 ***
+# sexF            0.526537   0.188174   2.798 0.005140 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  844.29  on 944  degrees of freedom
+# AIC: 864.29
+
+### modelg1.9 built using stepwise regression showed the same AIC value as modela3.5
+### every variable improves AIC >4
+```
+
+```{r}
+### model g2 - predictors from modela3.5 built using both-direction stepwise regression
+### using 'step' function 
+```
+```{r}
+df_modelg$NewTG <- df_modelg$NewTG^-0.5
+
+### start with model with all predictors
+modelg2.1 <- glm(Cpep600~., data=df_modelg, family="binomial")
+
+### then using 'step' function
+modelg2.2 <- step(modelg2.1, direction="both")
+summary(modelg2.2)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)     3.098903   0.893764   3.467 0.000526 ***
+# sexF            0.526537   0.188174   2.798 0.005140 ** 
+# Calculated_BMI  0.052714   0.015884   3.319 0.000905 ***
+# DiabDuration   -0.142997   0.021112  -6.773 1.26e-11 ***
+# TimeToInsulin   0.122826   0.025088   4.896 9.79e-07 ***
+# NewTG          -3.332908   0.503443  -6.620 3.59e-11 ***
+# NewHDL         -0.921086   0.238280  -3.866 0.000111 ***
+# BasalBolusF     1.456188   0.251748   5.784 7.28e-09 ***
+# NewHbA1C2      -0.020772   0.004805  -4.323 1.54e-05 ***
+# Creatinine      0.010675   0.003175   3.362 0.000773 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  844.29  on 944  degrees of freedom
+# AIC: 864.29
+
+### modelg2.2 is similar to modela3.4
+```
+
+```{r}
+##### modela3.5 has the lowest AIC value, therefore selected as the best performing model #####
+```
+
+```{r}
+### modela5.1 - simplified model with 4 readily available clinical variables
+```
+```{r}
+modela5.1 <- with(df_modela, glm(Cpep600~ Calculated_BMI+DiabDuration+TimeToInsulin+BasalBolus, family=binomial))
+summary(modela5.1)
+# Coefficients:
+#                Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -2.03015    0.54386  -3.733 0.000189 ***
+# Calculated_BMI  0.09039    0.01477   6.121 9.32e-10 ***
+# DiabDuration   -0.14305    0.01879  -7.611 2.72e-14 ***
+# TimeToInsulin   0.12603    0.02274   5.542 2.98e-08 ***
+# BasalBolusF     1.26749    0.23056   5.497 3.85e-08 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1133.01  on 953  degrees of freedom
+# Residual deviance:  984.15  on 949  degrees of freedom
+# AIC: 994.15
+```
+
+
+```{r}
+########## INTERNAL VALIDATION ########## 
+# comparing FULL MODEL (modela3.5) vs BASIC MODEL (modela5.1)
+```
+
+```{r}
+########## 5-FOLD CROSS-VALIDATION USING TRAINING DATA ########## 
+```
+```{r}
+### create function to show more performance metrics summary when performing KFCV and Bootstrapping
+customsummary <- function(data, lev=NULL, model=NULL){
+  out <- multiClassSummary(data, lev, model)
+  return(out)
+}
+```
+```{r}
+### 5-fold crossvalidation of modela3.5###
+```
+```{r}
+df_modela3.5 <- main12_trainlog[,c("sex", "Cpep600", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewTG", "NewHDL",  "BasalBolus", "NewHbA1C2", "Creatinine")]
+df_modela3.5$NewTG <- df_modela3.5$NewTG^-0.5
+### Data splitting
+set.seed(42)
+modela3.5_kfcv <- train(Cpep600~., data = df_modela3.5, trControl = trainControl(method = "repeatedcv",number =5, repeats = 3,summaryFunction = twoClassSummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial, metric="ROC")
+print(modela3.5_kfcv)
+
+auc_vals <- modela3.5_kfcv$resample$ROC #each resample AUC is stored here
+mean_auc <- mean(auc_vals) # mean AUC
+ci_auc <- quantile(auc_vals, c(0.025, 0.975)) #95% CI
+
+mean_auc # 0.8111506
+ci_auc 
+#      2.5%     97.5% 
+# 0.7692643 0.8521033 
+
+probs_kfcv <- modela3.5_kfcv$pred$High
+labels_kfcv <- modela3.5_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.81","\n",
+             "(95% CI: 0.77-0.85)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Full_KFCV.png", width = 7, height=6, dpi=300)
+```
+```{r}
+### 5-fold crossvalidation of modela5.1 ###
+```
+```{r}
+df_modela5.1 <- main12_trainlog[,c("Cpep600", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "BasalBolus")]
+
+### Data splitting
+set.seed(42)
+modela5.1_kfcv <- train(Cpep600~., data = df_modela5.1, trControl = trainControl(method = "repeatedcv",number =5, repeats = 3,summaryFunction = twoClassSummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial, metric="ROC")
+print(modela5.1_kfcv)
+
+auc_vals <- modela5.1_kfcv$resample$ROC #each resample AUC is stored here
+mean_auc <- mean(auc_vals) # mean AUC
+ci_auc <- quantile(auc_vals, c(0.025, 0.975)) #95% CI
+
+mean_auc # 0.7293481
+ci_auc 
+#      2.5%     97.5% 
+# 0.6762639 0.7718019 
+
+probs_kfcv <- modela5.1_kfcv$pred$High
+labels_kfcv <- modela5.1_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.73","\n",
+             "(95% CI: 0.68-0.77)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Basic_KFCV.png", width = 7, height=6, dpi=300)
+```
+
+```{r}
+########## BOOTSTRAPPING USING TRAINING DATA ########## 
+### bootstrapping using 100 iterations (mean performance metrics - accuracy - appears to be similar with 48, 88, 200, 300 and 599 iterations)
+```
+```{r}
+### Bootstrapping of modela3.5###
+```
+```{r}
+df_modela3.5 <- main12_trainlog[,c("sex", "Cpep600", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewTG", "NewHDL",  "BasalBolus", "NewHbA1C2", "Creatinine")]
+df_modela3.5$NewTG <- df_modela3.5$NewTG^-0.5
+
+set.seed(123) # for reproducibility
+
+modela3.5_boot <- train(Cpep600~., data = df_modela3.5, trControl = trainControl(method = "boot",number =100, summaryFunction = customsummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial)
+print(modela3.5_boot)
+
+roc_vals <- replicate(1000, {
+  idx <-sample(1:nrow(df_modela3.5), replace=T)
+  boot_df <-df_modela3.5[idx,]
+  boot_model <-glm(Cpep600~.,data=boot_df,family=binomial)
+  probs <-predict(boot_model,boot_df,type="response")
+  auc(roc(boot_df$Cpep600,probs))
+})
+quantile(roc_vals, c(0.025,0.975))
+#      2.5%     97.5% 
+# 0.7961001 0.8558524 
+
+probs_boot <- modela3.5_boot$pred$High
+labels_boot <- modela3.5_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.81","\n",
+             "(95% CI: 0.80-0.86)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Full_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+```
+```{r}
+### Bootstrapping of modela5.1###
+```
+```{r}
+df_modela5.1 <- main12_trainlog[,c("Cpep600", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "BasalBolus")]
+
+set.seed(123) # for reproducibility
+
+modela5.1_boot <- train(Cpep600~., data = df_modela5.1, trControl = trainControl(method = "boot",number =100, summaryFunction = customsummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial)
+print(modela5.1_boot)
+
+roc_vals <- replicate(1000, {
+  idx <-sample(1:nrow(df_modela5.1), replace=T)
+  boot_df <-df_modela5.1[idx,]
+  boot_model <-glm(Cpep600~.,data=boot_df,family=binomial)
+  probs <-predict(boot_model,boot_df,type="response")
+  auc(roc(boot_df$Cpep600,probs))
+})
+quantile(roc_vals, c(0.025,0.975))
+#      2.5%     97.5% 
+# 0.7011402 0.7747595 
+
+probs_boot <- modela5.1_boot$pred$High
+labels_boot <- modela5.1_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.73","\n",
+             "(95% CI: 0.70-0.77)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Basic_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+```
+
+```{r}
+########## INTERNAL VALIDATION USING TESTING DATA (20% of main12 dataframe) ########## 
+```
+```{r}
+### Test Model A3.5 with TESTING data ###
+```
+```{r}
+modela3.5_pred_test <- predict(modela3.5, newdata = select(main12_testlog, -Cpep600), type="response")
+modela3.5_predoutcome_test <- ifelse(modela3.5_pred_test <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+modela3.5_predoutcome_test <- factor(modela3.5_predoutcome_test, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela3.5_tab_test <- table(main12_testlog$Cpep600, modela3.5_predoutcome_test, dnn = c("observed", "predicted"))
+modela3.5_tab_test
+#         predicted
+# observed Low High
+#     Low   37   29
+#     High  13  158
+
+### Accuracy 
+modela3.5_acc_test <- sum(diag(modela3.5_tab_test))/sum(modela3.5_tab_test)
+modela3.5_acc_test ###  0.8227848
+
+### Sensitivity and specificity 
+modela3.5_sens_test <- modela3.5_tab_test[2,2]/(modela3.5_tab_test[2,2] + modela3.5_tab_test[2,1])
+modela3.5_spec_test <- modela3.5_tab_test[1,1]/(modela3.5_tab_test[1,1] + modela3.5_tab_test[1,2])
+modela3.5_sens_test ###  0.9239766
+modela3.5_spec_test ###  0.5606061
+
+### PPV and NPV 
+modela3.5_ppv_test <- modela3.5_tab_test[2,2]/(modela3.5_tab_test[2,2] + modela3.5_tab_test[1,2])
+modela3.5_npv_test <- modela3.5_tab_test[1,1]/(modela3.5_tab_test[1,1] + modela3.5_tab_test[2,1])
+modela3.5_ppv_test ### 0.8449198
+modela3.5_npv_test ### 0.74
+
+### AUC and ROC 
+modela3.5_roc_test <- roc(MAIN5_testlog$Cpep600, modela3.5_pred_test)
+ggroc(modela3.5_roc_test, legacy.axes=TRUE)
+
+modela3.5_auc_test <-auc(modela3.5_roc_test) 
+
+ggroc(modela3.5_roc_test, colour = "skyblue", size= 1)+
+  theme_bw()+
+  labs(x = "False Positive Rate", y="True Positive Rate") +
+  theme(
+    axis.title = element_text(size=14, color = "black", face="bold"),
+    axis.text = element_text(size=12, color = "black", face="bold")
+  )+
+  annotate ("text", x=0.7, y=0.2, label = paste("AUC = ", round (modela3.5_auc_test,2)),
+            size=5)
+modela3.5_roc_test$auc ### 0.8673
+
+ggroc(modela3.5_roc_test, colour = "skyblue", size= 1)+
+  theme_bw()+
+  labs(x = "False Positive Rate", y="True Positive Rate") +
+  theme(
+    axis.title = element_text(size=14, color = "black", face="bold"),
+    axis.text = element_text(size=12, color = "black", face="bold")
+  )+
+  annotate ("text", x=0.7, y=0.2, label = paste("AUC = ", round (modela3.5_auc_test,2)),
+            size=5)
+
+### Discrimination slope 
+modela3.5_meanpos <- mean(modela3.5_pred_test[MAIN5_testlog$Cpep600=="High"])
+modela3.5_meanneg <- mean(modela3.5_pred_test[MAIN5_testlog$Cpep600=="Low"])
+modela3.5_discslope <-modela3.5_meanpos - modela3.5_meanneg
+print(modela3.5_discslope) ###0.3655307
+
+### create dataframe for plotting discrimination slope
+df <- data.frame(modela3.5_pred_test, outcome = MAIN5_testlog$Cpep600)
+ggplot(df,aes(x= outcome, y= modela3.5_pred_test, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A3.5",
+       x="Cpep600",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela3.5_pred_test, breaks=quantile(modela3.5_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela3.5_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+### Calibration slope value
+logit_pred <- log(modela3.5_pred_test/(1-modela3.5_pred_test)) ### convert predicted probabilities to log odds
+modela3.5_calib <- glm(Cpep600~logit_pred, family=binomial, data = MAIN5_testlog) ### fit logistic regression to calculate calibration slope
+calibration_slope <- coef(modela3.5_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 1.119193463
+### calibration slope of 1 indicates perfect calibration. the predicted probabilities match the observed outcomes without over- or underfitting. <1 indicates overfitting; >1 indicates underfitting
+
+###  calibration plot
+png("modela3.5_Calibration.png", width = 1500, height=1000, res=300)
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="skyblue", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_minimal()+
+  theme(
+    axis.title = element_text(size=14, color = "black", face="bold"),
+    axis.text = element_text(size=12, color = "black", face="bold")
+  )+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+dev.off()
+```
+```{r}
+### Test Model A5.1 with TESTING data ###
+```
+```{r}
+modela5.1_pred_test <- predict(modela5.1, newdata = select(main12_testlog, -Cpep600), type="response")
+
+modela5.1_predoutcome_test <- ifelse(modela5.1_pred_test <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela5.1_predoutcome_test <- factor(modela5.1_predoutcome_test, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela5.1_tab_test <- table(MAIN5_testlog$Cpep600, modela5.1_predoutcome_test, dnn = c("observed", "predicted"))
+modela5.1_tab_test
+#         predicted
+# observed Low High
+#     Low   28   38
+#     High  12  159
+
+### Accuracy 
+modela5.1_acc_test <- sum(diag(modela5.1_tab_test))/sum(modela5.1_tab_test)
+modela5.1_acc_test ###  0.7890295
+
+### Sensitivity and specificity 
+modela5.1_sens_test <-modela5.1_tab_test[2,2]/(modela5.1_tab_test[2,2] + modela5.1_tab_test[2,1])
+modela5.1_spec_test <- modela5.1_tab_test[1,1]/(modela5.1_tab_test[1,1] + modela5.1_tab_test[1,2])
+
+modela5.1_sens_test ###  0.9298246
+modela5.1_spec_test ###  0.4242424
+
+### PPV and NPV 
+modela5.1_ppv_test <- modela5.1_tab_test[2,2]/(modela5.1_tab_test[2,2] + modela5.1_tab_test[1,2])
+modela5.1_npv_test <-modela5.1_tab_test[1,1]/(modela5.1_tab_test[1,1] + modela5.1_tab_test[2,1])
+
+modela5.1_ppv_test ### 0.8071066
+modela5.1_npv_test ### 0.7
+
+### AUC and ROC 
+modela5.1_roc_test <- roc(MAIN5_testlog$Cpep600, modela5.1_pred_test)
+ggroc(modela5.1_roc_test, legacy.axes=TRUE)
+
+modela5.1_roc_test$auc ### 0.7788
+
+### R squared values 
+rsquared <- function(modela5.1) {
+  dev<- modela5.1$deviance
+  null_dev <- modela5.1$null.deviance
+  model_n <- length(modela5.1$fitted.values)
+  R_l <- 1- dev/null_dev
+  R_cs <- 1 - exp(-(null_dev - dev) /model_n)
+  R_n <- R_cs / (1-exp(-(null_dev/model_n)))
+  cat("Pseudo R-squared for logistic regression model\n\n")
+  cat("Hosmes and Lemeshow R-squared\t", round(R_l, 3),"\n")
+  cat("Cox and Snell R-squared\t\t", round(R_cs,3),"\n")
+  cat("Nagelkerke R-dquared\t\t", round(R_n,3), "\n")
+}
+rsquared(modela5.1)
+# Hosmes and Lemeshow R-squared	 0.131 
+# Cox and Snell R-squared		 0.144 
+# Nagelkerke R-dquared		 0.208 
+
+### Discrimination slope and calibration plot 
+modela5.1_meanpos <- mean(modela5.1_pred_test[MAIN5_testlog$Cpep600=="High"])
+modela5.1_meanneg <- mean(modela5.1_pred_test[MAIN5_testlog$Cpep600=="Low"])
+modela5.1_discslope <-modela5.1_meanpos - modela5.1_meanneg
+print(modela5.1_discslope) ###0.2059719
+
+### create dataframe for plotting 
+df <- data.frame(modela5.1_pred_test, outcome = MAIN5_testlog$Cpep600)
+
+### discrimination slope (boxplot)
+ggplot(df,aes(x= outcome, y= modela5.1_pred_test, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A5.1",
+       x="Cpep600",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela5.1_pred_test, breaks=quantile(modela5.1_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela5.1_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A5.1")
+# remove "geom_smooth(method=stats::loess, se=FALSE)+" (EP's advice)
+
+### Calibration slope value
+logit_pred <- log(modela5.1_pred_test/(1-modela5.1_pred_test)) ### convert predicted probabilities to log odds
+modela5.1_calib <- glm(Cpep600~logit_pred, family=binomial, data = MAIN5_testlog) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela5.1_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 1.185774616
+```
+
+```{r}
+########## SUBGROUP ANALYSIS (AGE 70 or above) ########## 
+```
+```{r}
+age70 <- main12%>% filter(AgeCpep >69)
+### 518 individuals
+```
+```{r}
+### Subgroup analysis with modela3.5 ###
+```
+```{r}
+modela3.5_pred_age70 <- predict(modela3.5, newdata = select(age70, -Cpep600), type="response")
+
+modela3.5_predoutcome_age70 <- ifelse(modela3.5_pred_age70 <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela3.5_predoutcome_age70 <- factor(modela3.5_predoutcome_age70, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela3.5_tab_age70 <- table(age70$Cpep600, modela3.5_predoutcome_age70, dnn = c("observed", "predicted"))
+modela3.5_tab_age70
+#         predicted
+# observed Low High
+#     Low   75   67
+#     High  35  341
+
+### Accuracy 
+modela3.5_acc_age70 <- sum(diag(modela3.5_tab_age70))/sum(modela3.5_tab_age70)
+modela3.5_acc_age70 ###  0.8030888
+
+### Sensitivity and specificity 
+modela3.5_sens_age70 <- modela3.5_tab_age70[2,2]/(modela3.5_tab_age70[2,2] + modela3.5_tab_age70[2,1])
+modela3.5_spec_age70 <- modela3.5_tab_age70[1,1]/(modela3.5_tab_age70[1,1] + modela3.5_tab_age70[1,2])
+
+modela3.5_sens_age70 ###  0.9069149
+modela3.5_spec_age70 ###  0.528169
+
+### PPV and NPV 
+modela3.5_ppv_age70 <- modela3.5_tab_age70[2,2]/(modela3.5_tab_age70[2,2] + modela3.5_tab_age70[1,2])
+modela3.5_npv_age70<- modela3.5_tab_age70[1,1]/(modela3.5_tab_age70[1,1] + modela3.5_tab_age70[2,1])
+
+modela3.5_ppv_age70 ### 0.8357843
+modela3.5_npv_age70 ### 0.6818182
+
+### AUC and ROC 
+modela3.5_roc_age70 <- roc(age70$Cpep600, modela3.5_pred_age70)
+ggroc(modela3.5_roc_age70, legacy.axes=TRUE)
+
+modela3.5_roc_age70$auc ### 0.8409
+
+roc_a3.5_age70 <- roc(age70$Cpep600, modela3.5_pred_age70)
+ci_a3.5_age70 <- ci.auc(roc_a3.5_age70) ## 95% CI 
+print(ci_a3.5_age70) # 95% CI: 0.8031-0.8786 (DeLong)
+
+### Discrimination slope and calibration plot 
+modela3.5_meanpos <- mean(modela3.5_pred_age70[age70$Cpep600=="High"])
+modela3.5_meanneg <- mean(modela3.5_pred_age70[age70$Cpep600=="Low"])
+modela3.5_discslope <-modela3.5_meanpos - modela3.5_meanneg
+print(modela3.5_discslope) ###0.3185847
+
+### create dataframe for plotting 
+df <- data.frame(modela3.5_pred_age70, outcome = age70$Cpep600)
+
+### discrimination slope (boxplot)
+ggplot(df,aes(x= outcome, y= modela3.5_pred_age70, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A3.5 (Age>=70)",
+       x="Cpep600",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela3.5_pred_age70, breaks=quantile(modela3.5_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela3.5_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A3.5 (Age>=70)")
+# remove "geom_smooth(method=stats::loess, se=FALSE)+" (EP's advice)
+
+### Calibration slope value
+logit_pred <- log(modela3.5_pred_age70/(1-modela3.5_pred_age70)) ### convert predicted probabilities to log odds
+modela3.5_calib <- glm(Cpep600~logit_pred, family=binomial, data = age70) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela3.5_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 1.0474230
+```
+```{r}
+### Subgroup analysis with modela5.1 ###
+```
+```{r}
+modela5.1_pred_age70 <- predict(modela5.1, newdata = select(age70, -Cpep600), type="response")
+
+modela5.1_predoutcome_age70 <- ifelse(modela5.1_pred_age70 <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela5.1_predoutcome_age70 <- factor(modela5.1_predoutcome_age70, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela5.1_tab_age70 <- table(age70$Cpep600, modela5.1_predoutcome_age70, dnn = c("observed", "predicted"))
+modela5.1_tab_age70
+#         predicted
+# observed Low High
+#     Low   60   82
+#     High  29  347
+
+### Accuracy 
+modela5.1_acc_age70 <- sum(diag(modela5.1_tab_age70))/sum(modela5.1_tab_age70)
+modela5.1_acc_age70 ###  0.7857143
+
+### Sensitivity and specificity 
+modela5.1_sens_age70 <- modela5.1_tab_age70[2,2]/(modela5.1_tab_age70[2,2] + modela5.1_tab_age70[2,1])
+modela5.1_spec_age70 <- modela5.1_tab_age70[1,1]/(modela5.1_tab_age70[1,1] + modela5.1_tab_age70[1,2])
+
+modela5.1_sens_age70 ###  0.9228723
+modela5.1_spec_age70 ###  0.4225352
+
+### PPV and NPV
+modela5.1_ppv_age70 <- modela5.1_tab_age70[2,2]/(modela5.1_tab_age70[2,2] + modela5.1_tab_age70[1,2])
+modela5.1_npv_age70<- modela5.1_tab_age70[1,1]/(modela5.1_tab_age70[1,1] + modela5.1_tab_age70[2,1])
+
+modela5.1_ppv_age70 ### 0.8088578
+modela5.1_npv_age70 ### 0.6741573
+
+### AUC and ROC
+modela5.1_roc_age70 <- roc(age70$Cpep600, modela5.1_pred_age70)
+ggroc(modela5.1_roc_age70, legacy.axes=TRUE)
+
+modela5.1_roc_age70$auc ### 0.7563
+
+### Discrimination slope and calibration plot 
+modela5.1_meanpos <- mean(modela5.1_pred_age70[age70$Cpep600=="High"])
+modela5.1_meanneg <- mean(modela5.1_pred_age70[age70$Cpep600=="Low"])
+modela5.1_discslope <-modela5.1_meanpos - modela5.1_meanneg
+print(modela5.1_discslope) ###0.2059719
+
+### create dataframe for plotting 
+df <- data.frame(modela5.1_pred_age70, outcome = age70$Cpep600)
+
+### discrimination slope (boxplot)
+ggplot(df,aes(x= outcome, y= modela5.1_pred_age70, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A5.1 (Age>=70)",
+       x="Cpep600",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela5.1_pred_age70, breaks=quantile(modela5.1_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela5.1_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A5.1 (Age>=70)")
+# remove "geom_smooth(method=stats::loess, se=FALSE)+"
+
+### Calibration slope value
+logit_pred <- log(modela5.1_pred_age70/(1-modela5.1_pred_age70)) ### convert predicted probabilities to log odds
+modela5.1_calib <- glm(Cpep600~logit_pred, family=binomial, data = age70) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela5.1_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 1.1780008
+```
+
+######################################################################################################
+######################################################################################################
+```{r}
+########## SECONDARY ANALYSIS ########## 
+
+##### MULTIVARIABLE BINARY LOGISTIC REGRESSION #####
+### C-peptide outcome threshold: 900pmol/L
+### C-peptide >=900 = High ###
+### C-peptide <900 = Low ### 
+
+##### SPLITTING MAIN5 DATAFRAME TO TRAINING AND TESTING DATA #####
+### 80:20
+```
+```{r}
+set.seed(42) ## set seed to generate a reproducible random sample
+train_index <- createDataPartition(main12$Cpep900, p=0.8, list=FALSE) ## split into 80% training, 20% testing
+main12_traindf <- main12[train_index,]
+main12_testdf <- main12[-train_index,]
+dim(main12_traindf)  ### 953  24
+dim(main12_testdf) ###  238  24
+```
+
+```{r}
+########## MODEL DEVELOPMENT ########## 
+```
+
+```{r}
+###### modela1 - no polynomial or transformation
+###### modela2 - polynomial power -0.5 for triglycerides (identified using 'mfp' package) ###### selected as best performing model, named as 'FULL MODEL' in manuscript
+###### modela4.1 - simplified model with 4 readily available clinical variables ###### names as 'BASIC MODEL' in manuscript
+```
+
+```{r}
+### MODEL A ### 
+```
+```{r}
+model_a_df <- main12_traindf[,c("sex", "AgeCpep", "Cpep900", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL", "OnSU", "BasalBolus", "NewHbA1C2", "Creatinine")]
+```
+
+```{r}
+### modela1 - no polynomial or transformation
+```
+```{r}
+modela1.1 <-glm(Cpep900~., data = model_a_df, family = "binomial")
+summary(modela1.1)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -2.561454   1.003669  -2.552 0.010708 *  
+# sexF            0.758984   0.166799   4.550 5.36e-06 ***
+# AgeCpep         0.031510   0.008889   3.545 0.000393 ***
+# Calculated_BMI  0.066259   0.013887   4.771 1.83e-06 ***
+# DiabDuration   -0.128696   0.020557  -6.260 3.84e-10 ***
+# TimeToInsulin   0.075133   0.023224   3.235 0.001216 ** 
+# NewALT2         0.011995   0.004984   2.407 0.016089 *  
+# NewTG           0.233477   0.058083   4.020 5.83e-05 ***
+# NewHDL         -1.209430   0.234989  -5.147 2.65e-07 ***
+# OnSUF          -0.776110   0.446977  -1.736 0.082501 .  
+# BasalBolusF     0.838907   0.262683   3.194 0.001405 ** 
+# NewHbA1C2      -0.012422   0.004308  -2.883 0.003935 ** 
+# Creatinine      0.009039   0.002867   3.153 0.001618 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1318.8  on 952  degrees of freedom
+# Residual deviance: 1060.7  on 940  degrees of freedom
+# AIC: 1086.7
+
+### run Anova type 2 
+Anova(modela1.1, type="2")
+# Analysis of Deviance Table (Type II tests)
+# 
+# Response: Cpep900
+#                LR Chisq Df Pr(>Chisq)    
+# sex              21.308  1  3.910e-06 ***
+# AgeCpep          12.785  1  0.0003494 ***
+# Calculated_BMI   24.139  1  8.961e-07 ***
+# DiabDuration     43.394  1  4.476e-11 ***
+# TimeToInsulin    10.810  1  0.0010096 ** 
+# NewALT2           6.072  1  0.0137367 *  
+# NewTG            18.079  1  2.119e-05 ***
+# NewHDL           29.751  1  4.913e-08 ***
+# OnSU              3.291  1  0.0696680 .  
+# BasalBolus       10.589  1  0.0011378 ** 
+# NewHbA1C2         8.410  1  0.0037313 ** 
+# Creatinine       10.395  1  0.0012635 ** 
+
+### use step function for MSM using backward elimianation ### 
+modela1.2 <- step(modela1.1)
+summary(modela1.2)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -2.561454   1.003669  -2.552 0.010708 *  
+# sexF            0.758984   0.166799   4.550 5.36e-06 ***
+# AgeCpep         0.031510   0.008889   3.545 0.000393 ***
+# Calculated_BMI  0.066259   0.013887   4.771 1.83e-06 ***
+# DiabDuration   -0.128696   0.020557  -6.260 3.84e-10 ***
+# TimeToInsulin   0.075133   0.023224   3.235 0.001216 ** 
+# NewALT2         0.011995   0.004984   2.407 0.016089 *  
+# NewTG           0.233477   0.058083   4.020 5.83e-05 ***
+# NewHDL         -1.209430   0.234989  -5.147 2.65e-07 ***
+# OnSUF          -0.776110   0.446977  -1.736 0.082501 .  
+# BasalBolusF     0.838907   0.262683   3.194 0.001405 ** 
+# NewHbA1C2      -0.012422   0.004308  -2.883 0.003935 ** 
+# Creatinine      0.009039   0.002867   3.153 0.001618 ** 
+# 
+#     Null deviance: 1318.8  on 952  degrees of freedom
+# Residual deviance: 1060.7  on 940  degrees of freedom
+# AIC: 1086.7
+
+### step function does not remove OnSU
+
+### use drop function to see if any covariates need to be dropped from modela1.1
+drop1(modela1.1, test="Chisq")
+# Single term deletions
+# 
+# Model:
+# Cpep900 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewALT2 + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + 
+#     Creatinine
+#                Df Deviance    AIC    LRT  Pr(>Chi)    
+# <none>              1060.7 1086.7                     
+# sex             1   1082.0 1106.0 21.308 3.910e-06 ***
+# AgeCpep         1   1073.5 1097.5 12.785 0.0003494 ***
+# Calculated_BMI  1   1084.8 1108.8 24.139 8.961e-07 ***
+# DiabDuration    1   1104.1 1128.1 43.394 4.476e-11 ***
+# TimeToInsulin   1   1071.5 1095.5 10.810 0.0010096 ** 
+# NewALT2         1   1066.7 1090.7  6.072 0.0137367 *  
+# NewTG           1   1078.8 1102.8 18.079 2.119e-05 ***
+# NewHDL          1   1090.4 1114.4 29.751 4.913e-08 ***
+# OnSU            1   1064.0 1088.0  3.291 0.0696680 .  
+# BasalBolus      1   1071.3 1095.3 10.589 0.0011378 ** 
+# NewHbA1C2       1   1069.1 1093.1  8.410 0.0037313 ** 
+# Creatinine      1   1071.1 1095.1 10.395 0.0012635 **
+
+### try manually removing OnSU
+modela1.3 <- update(modela1.1, ~.-OnSU)
+summary(modela1.3)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -3.295777   0.908652  -3.627 0.000287 ***
+# sexF            0.742001   0.166337   4.461 8.16e-06 ***
+# AgeCpep         0.032272   0.008856   3.644 0.000268 ***
+# Calculated_BMI  0.065556   0.013754   4.766 1.87e-06 ***
+# DiabDuration   -0.133132   0.020440  -6.513 7.35e-11 ***
+# TimeToInsulin   0.078267   0.023201   3.373 0.000742 ***
+# NewALT2         0.012583   0.004948   2.543 0.010983 *  
+# NewTG           0.232345   0.058079   4.000 6.32e-05 ***
+# NewHDL         -1.232582   0.234508  -5.256 1.47e-07 ***
+# BasalBolusF     0.843165   0.263005   3.206 0.001346 ** 
+# NewHbA1C2      -0.012234   0.004302  -2.844 0.004456 ** 
+# Creatinine      0.009013   0.002864   3.147 0.001650 ** 
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1318.8  on 952  degrees of freedom
+# Residual deviance: 1064.0  on 941  degrees of freedom
+# AIC: 1088
+
+### removing OnSU marginally increased AIC
+
+
+### compare maximal model (modela1.1) and MSM (modela1.3)using anova function
+anova(modela1.1, modela1.3, test="Chisq")
+# Analysis of Deviance Table
+# 
+# Model 1: Cpep900 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewALT2 + NewTG + NewHDL + OnSU + BasalBolus + NewHbA1C2 + 
+#     Creatinine
+# Model 2: Cpep900 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + 
+#     NewALT2 + NewTG + NewHDL + BasalBolus + NewHbA1C2 + Creatinine
+#   Resid. Df Resid. Dev Df Deviance Pr(>Chi)  
+# 1       940     1060.7                       
+# 2       941     1064.0 -1  -3.2908  0.06967
+
+### no significant difference in residual deviation between both models
+
+### compare both models using likelihood ratio statistics
+# extract log-likehoods for modela1.1 and modela1.3
+loglik_modela1.3 <- logLik(modela1.3) #(11 covariates)
+loglik_modela1.1 <- logLik(modela1.1) #(12 covariates)
+loglik_modela1.3 ### -531.9804 (df=12)
+loglik_modela1.1 ### -530.335 (df=13)
+
+#compute likelihood ratio statistic
+lr_statistic <- -2*(loglik_modela1.3 - loglik_modela1.1)
+lr_statistic ### 3.290825 (df=12)
+
+#find degrees of freedom (difference in the number of parameters)
+df <- attr(loglik_modela1.1, "df") - attr(loglik_modela1.3, "df")
+
+#compare p-value
+pvalue <- pchisq(lr_statistic, df, lower.tail=F)
+pvalue ### 0.06966801 (df=12)
+
+### again, no significant difference in models with or without OnSU
+
+### compare R squared values between both
+### R-squared for modela1.1
+rsquared <- function(modela1.1) {
+  dev<- modela1.1$deviance
+  null_dev <- modela1.1$null.deviance
+  model_n <- length(modela1.1$fitted.values)
+  R_l <- 1- dev/null_dev
+  R_cs <- 1 - exp(-(null_dev - dev) /model_n)
+  R_n <- R_cs / (1-exp(-(null_dev/model_n)))
+  cat("Pseudo R-squared for logistic regression model\n\n")
+  cat("Hosmes and Lemeshow R-squared\t", round(R_l, 3),"\n")
+  cat("Cox and Snell R-squared\t\t", round(R_cs,3),"\n")
+  cat("Nagelkerke R-dquared\t\t", round(R_n,3), "\n")
+}
+rsquared(modela1.1)
+# Hosmes and Lemeshow R-squared	  0.196
+# Cox and Snell R-squared		  0.237
+# Nagelkerke R-dquared		  0.317
+
+### R-squared for modela1.3
+rsquared <- function(modela1.3) {
+  dev<- modela1.3$deviance
+  null_dev <- modela1.3$null.deviance
+  model_n <- length(modela1.3$fitted.values)
+  R_l <- 1- dev/null_dev
+  R_cs <- 1 - exp(-(null_dev - dev) /model_n)
+  R_n <- R_cs / (1-exp(-(null_dev/model_n)))
+  cat("Pseudo R-squared for logistic regression model\n\n")
+  cat("Hosmes and Lemeshow R-squared\t", round(R_l, 3),"\n")
+  cat("Cox and Snell R-squared\t\t", round(R_cs,3),"\n")
+  cat("Nagelkerke R-dquared\t\t", round(R_n,3), "\n")
+}
+rsquared(modela1.3)
+# Hosmes and Lemeshow R-squared	  0.193
+# Cox and Snell R-squared		  0.235
+# Nagelkerke R-dquared		  0.313
+
+
+### given that AIC is lowest with OnSU (according to step fuction), and this is biologically feasible, and clinically not a difficult information to collect (patient has sulphonylurea prescription within 6 months), I have decided to choose the maximal model (modela1.1) as best performing model when no transformation or polynomial function is used on explanatory covariates
+```
+
+```{r}
+### modela2 - polynomial power -0.5 for triglycerides (identified using 'mfp' package) 
+```
+```{r}
+### Use multivariable fractional polynomial
+mfpmodel<- mfp(factor(Cpep900)~sex + fp(AgeCpep) + fp(Calculated_BMI) + fp(DiabDuration) + fp(TimeToInsulin) + fp(NewALT2) + fp(NewTG) + fp(NewHDL) + OnSU + BasalBolus + fp(NewHbA1C2) + fp(Creatinine), data=model_a_df, family= binomial)
+mfpmodel
+# Deviance table:
+#  		 Resid. Dev
+# Null model	 1133.013
+# Linear model	 858.9302
+# Final model	 843.584
+# 
+# Fractional polynomials:
+#                df.initial select alpha df.final power1 power2
+# DiabDuration            4      1  0.05        1      1      .
+# NewTG                   4      1  0.05        2   -0.5      .
+# BasalBolusF             1      1  0.05        1      1      .
+# NewHDL                  4      1  0.05        1      1      .
+# TimeToInsulin           4      1  0.05        1      1      .
+# NewHbA1C2               4      1  0.05        1      1      .
+# Calculated_BMI          4      1  0.05        1      1      .
+# sexF                    1      1  0.05        1      1      .
+# Creatinine              4      1  0.05        1      1      .
+# OnSUF                   1      1  0.05        1      1      .
+# AgeCpep                 4      1  0.05        1      1      .
+# NewALT2                 4      1  0.05        1      1      .
+# 
+# 
+# Transformations of covariates:
+#                                    formula
+# sex                                    sex
+# AgeCpep                 I((AgeCpep/100)^1)
+# Calculated_BMI   I((Calculated_BMI/100)^1)
+# DiabDuration        I((DiabDuration/10)^1)
+# TimeToInsulin  I(((TimeToInsulin+1)/10)^1)
+# NewALT2                  I((NewALT2/10)^1)
+# NewTG                        I(NewTG^-0.5)
+# NewHDL                         I(NewHDL^1)
+# OnSU                                  OnSU
+# BasalBolus                      BasalBolus
+# NewHbA1C2             I((NewHbA1C2/100)^1)
+# Creatinine           I((Creatinine/100)^1)
+# 
+# Coefficients:
+#        Intercept    DiabDuration.1           NewTG.1     BasalBolusF.1          NewHDL.1   TimeToInsulin.1       NewHbA1C2.1  
+#         3.094131         -1.426545         -3.345839          1.425493         -0.913735          1.211734         -2.041228  
+# Calculated_BMI.1            sexF.1      Creatinine.1           OnSUF.1         AgeCpep.1         NewALT2.1  
+#         5.339391          0.525693          1.031460         -0.381844          0.391435          0.006099  
+# 
+# Degrees of Freedom: 953 Total (i.e. Null);  941 Residual
+# Null Deviance:	    1133 
+# Residual Deviance: 843.6 	AIC: 869.6 
+```
+```{r}
+modela2.1 <- with(model_a_df, glm(Cpep900 ~ sex + AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewALT2 + NewHDL + OnSU + BasalBolus + NewHbA1C2 + Creatinine + I(NewTG^-0.5), family = "binomial"))
+summary(modela2.1)
+# Coefficients:
+#                 Estimate Std. Error z value Pr(>|z|)
+# (Intercept)    -0.139478   1.041346  -0.134 0.893450
+# sexF            0.685260   0.168173   4.075 4.61e-05 ***
+# AgeCpep         0.030450   0.008908   3.418 0.000631 ***
+# Calculated_BMI  0.059684   0.013954   4.277 1.89e-05 ***
+# DiabDuration   -0.124746   0.020718  -6.021 1.73e-09 ***
+# TimeToInsulin   0.071001   0.023426   3.031 0.002439 **
+# NewALT2         0.011710   0.004997   2.343 0.019115 *
+# NewHDL         -0.937562   0.245217  -3.823 0.000132 ***
+# OnSUF          -0.719684   0.450116  -1.599 0.109846
+# BasalBolusF     0.812466   0.262333   3.097 0.001954 **
+# NewHbA1C2      -0.013281   0.004294  -3.093 0.001984 **
+# Creatinine      0.008477   0.002855   2.969 0.002988 **
+# I(NewTG^-0.5)  -2.506263   0.457724  -5.475 4.36e-08 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1318.8  on 952  degrees of freedom
+# Residual deviance: 1047.0  on 940  degrees of freedom
+# AIC: 1073
+
+### use 'step' function for MSM
+modela2.2 <- step(modela2.1)
+summary(modela2.2) ### no covariate removed - similar to modela2.1
+```
+```{r}
+
+### modela1.1 (AIC 1086.7) vs modela2.1 (AIC 1073) 
+##### modela2.1 has the lowest AIC value, therefore selected as the best performing model #####
+```
+
+```{r}
+### modela4.1 - simplified model with 4 readily available clinical variables 
+```
+```{r}
+modela4.1 <- with(model_a_df, glm(Cpep900~ Calculated_BMI+DiabDuration+TimeToInsulin+BasalBolus, family=binomial))
+summary(modela4.1)
+# Coefficients:
+#                Estimate Std. Error z value Pr(>|z|)    
+# (Intercept)    -2.19599    0.48112  -4.564 5.01e-06 ***
+# Calculated_BMI  0.07494    0.01233   6.077 1.23e-09 ***
+# DiabDuration   -0.11935    0.01828  -6.529 6.60e-11 ***
+# TimeToInsulin   0.07951    0.02137   3.721 0.000199 ***
+# BasalBolusF     0.98014    0.23777   4.122 3.75e-05 ***
+# ---
+# Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# (Dispersion parameter for binomial family taken to be 1)
+# 
+#     Null deviance: 1318.8  on 952  degrees of freedom
+# Residual deviance: 1193.8  on 948  degrees of freedom
+# AIC: 1203.8
+```
+
+```{r}
+########## INTERNAL VALIDATION ########## 
+# comparing FULL MODEL (modela2.1) vs BASIC MODEL (modela4.1)
+```
+
+```{r}
+########## 5-FOLD CROSS-VALIDATION USING TRAINING DATA ########## 
+```
+```{r}
+### create function to show more performance metrics summary when performing KFCV and Bootstrapping
+customsummary <- function(data, lev=NULL, model=NULL){
+  out <- multiClassSummary(data, lev, model)
+  return(out)
+}
+```
+```{r}
+### 5-fold crossvalidation of modela2.1###
+```
+```{r}
+### create dataframe with final predictors in modela2.1
+df_modela2.1 <- main12_traindf[,c("sex", "AgeCpep", "Cpep900", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL",  "BasalBolus", "NewHbA1C2", "Creatinine")]
+df_modela2.1$NewTG <- df_modela2.1$NewTG^-0.5
+### Data splitting
+set.seed(42)
+modela2.1_kfcv <- train(Cpep900~., data = df_modela2.1, trControl = trainControl(method = "repeatedcv",number =5, repeats = 3, summaryFunction = customsummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial)
+print(modela2.1_kfcv)
+# 953 samples
+#  11 predictor
+#   2 classes: 'Low', 'High' 
+# 
+# No pre-processing
+# Resampling: Cross-Validated (5 fold, repeated 3 times) 
+# Summary of sample sizes: 762, 762, 763, 762, 763, 763, ... 
+# Resampling results:
+# 
+#   logLoss   AUC        prAUC      Accuracy   Kappa     F1         Sensitivity  Specificity  Pos_Pred_Value
+#   0.565691  0.7760991  0.7622989  0.6963939  0.388337  0.6624365  0.6306553    0.756        0.701055      
+#   Neg_Pred_Value  Precision  Recall     Detection_Rate  Balanced_Accuracy
+#   0.6950509       0.701055   0.6306553  0.299763        0.6933276      
+
+modela2.1_kfcv$results ### SD results
+
+set.seed(42)
+modela2.1_kfcv <- train(Cpep900~., data = df_modela2.1, trControl = trainControl(method = "repeatedcv",number =5, repeats = 3,summaryFunction = twoClassSummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial, metric="ROC")
+print(modela2.1_kfcv)
+
+auc_vals <- modela2.1_kfcv$resample$ROC #each resample AUC is stored here
+mean_auc <- mean(auc_vals) # mean AUC
+ci_auc <- quantile(auc_vals, c(0.025, 0.975)) #95% CI
+
+mean_auc # 0.7760991
+ci_auc 
+#      2.5%     97.5% 
+# 0.7167527 0.8399011 
+
+probs_kfcv <- modela2.1_kfcv$pred$High
+labels_kfcv <- modela2.1_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.77","\n",
+             "(95% CI: 0.72-0.84)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_KFCV.png", width = 7, height=6, dpi=300)
+
+```
+```{r}
+### 5-fold crossvalidation of modela4.1###
+```
+```{r}
+df_modela4.1 <- main12_traindf[,c("Cpep900", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "BasalBolus")]
+
+### Data splitting
+set.seed(42)
+modela4.1_kfcv <- train(Cpep900~., data = df_modela4.1, trControl = trainControl(method = "repeatedcv",number =5, repeats = 3,summaryFunction = twoClassSummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial)
+print(modela4.1_kfcv)
+# 
+# 953 samples
+#   4 predictor
+#   2 classes: 'Low', 'High' 
+# 
+# No pre-processing
+# Resampling: Cross-Validated (5 fold, repeated 3 times) 
+# Summary of sample sizes: 762, 762, 763, 762, 763, 763, ... 
+# Resampling results:
+# 
+#   ROC        Sens       Spec     
+#   0.6879008  0.5246805  0.7166667        
+
+modela4.1_kfcv$results ###  SD 		
+
+set.seed(42)
+modela4.1_kfcv <- train(Cpep900~., data = df_modela4.1, trControl = trainControl(method = "repeatedcv",number =5, repeats = 3,summaryFunction = twoClassSummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial, metric="ROC")
+
+auc_vals <- modela4.1_kfcv$resample$ROC #each resample AUC is stored here
+mean_auc <- mean(auc_vals) # mean AUC
+ci_auc <- quantile(auc_vals, c(0.025, 0.975)) #95% CI
+
+mean_auc # 0.6879008
+ci_auc 
+#      2.5%     97.5% 
+# 0.6224643 0.7405714 
+
+probs_kfcv <- modela4.1_kfcv$pred$High
+labels_kfcv <- modela4.1_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.69","\n",
+             "(95% CI: 0.62-0.74)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_Basic_KFCV.png", width = 7, height=6, dpi=300)
+```
+
+```{r}
+########## BOOTSTRAPPING USING TRAINING DATA ########## 
+### bootstrapping using 100 iterations 
+```
+```{r}
+### Bootstrapping of modela2.1###
+```
+```{r}
+df_modela2.1 <- main12_traindf[,c("sex", "AgeCpep", "Cpep900", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewALT2", "NewTG", "NewHDL",  "BasalBolus", "NewHbA1C2", "Creatinine")]
+df_modela2.1$NewTG <- df_modela2.1$NewTG^-0.5
+
+set.seed(123) # for reproducibility
+modela2.1_boot <- train(Cpep900~., data = df_modela2.1, trControl = trainControl(method = "boot",number =100, summaryFunction = customsummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial)
+print(modela2.1_boot)
+# 953 samples
+#  11 predictor
+#   2 classes: 'Low', 'High' 
+# 
+# No pre-processing
+# Resampling: Bootstrapped (100 reps) 
+# Summary of sample sizes: 953, 953, 953, 953, 953, 953, ... 
+# Resampling results:
+# 
+#   logLoss    AUC        prAUC      Accuracy   Kappa      F1         Sensitivity  Specificity  Pos_Pred_Value
+#   0.5709226  0.7733814  0.7639614  0.6948617  0.3862281  0.6648051  0.6388863    0.74669      0.6961423     
+#   Neg_Pred_Value  Precision  Recall     Detection_Rate  Balanced_Accuracy
+#   0.6958843       0.6961423  0.6388863  0.3033363       0.6927882   
+
+modela2.1_boot$results ### gives sd
+
+set.seed(123) # for reproducibility
+roc_vals <- replicate(1000, {
+  idx <-sample(1:nrow(df_modela2.1), replace=T)
+  boot_df <-df_modela2.1[idx,]
+  boot_model <-glm(Cpep900~.,data=boot_df,family=binomial)
+  probs <-predict(boot_model,boot_df,type="response")
+  auc(roc(boot_df$Cpep900,probs))
+})
+roc_ci<-quantile(roc_vals, c(0.025,0.975))
+#      2.5%     97.5% 
+# 0.7661223 0.8207781 
+
+probs_boot <- modela2.1_boot$pred$High
+labels_boot <- modela2.1_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.77","\n",
+             "(95% CI: 0.77-0.82)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+```
+```{r}
+### Bootstrapping of modela4.1###
+```
+```{r}
+df_modela4.1 <- main12_traindf[,c("Cpep900", "Calculated_BMI", "DiabDuration", "TimeToInsulin", "BasalBolus")]
+
+set.seed(123) # for reproducibility
+
+modela4.1_boot <- train(Cpep900~., data = df_modela4.1, trControl = trainControl(method = "boot",number =100, summaryFunction = customsummary, classProbs = T, savePredictions = "final"), method = "glm", family=binomial)
+print(modela4.1_boot)
+# 953 samples
+#   4 predictor
+#   2 classes: 'Low', 'High' 
+# 
+# No pre-processing
+# Resampling: Bootstrapped (100 reps) 
+# Summary of sample sizes: 953, 953, 953, 953, 953, 953, ... 
+# Resampling results:
+# 
+#   logLoss    AUC        prAUC      Accuracy   Kappa      F1         Sensitivity  Specificity  Pos_Pred_Value  Neg_Pred_Value  Precision  Recall     Detection_Rate  Balanced_Accuracy
+#   0.6348897  0.6866798  0.6803014  0.6230358  0.2400258  0.5695571  0.5275478    0.7115408    0.6249771       0.6248853       0.6249771  0.5275478  0.2502585       0.6195443            
+
+modela4.1_boot$results ### gives sd
+
+set.seed(123) # for reproducibility
+roc_vals <- replicate(1000, {
+  idx <-sample(1:nrow(df_modela4.1), replace=T)
+  boot_df <-df_modela4.1[idx,]
+  boot_model <-glm(Cpep900~.,data=boot_df,family=binomial)
+  probs <-predict(boot_model,boot_df,type="response")
+  auc(roc(boot_df$Cpep900,probs))
+})
+quantile(roc_vals, c(0.025,0.975))
+#      2.5%     97.5% 
+# 0.6627839 0.7270186 
+
+
+probs_boot <- modela4.1_boot$pred$High
+labels_boot <- modela4.1_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.69","\n",
+             "(95% CI: 0.66-0.73)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_Basic_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+```
+
+```{r}
+########## INTERNAL VALIDATION USING TESTING DATA (20% of main12 dataframe) ########## 
+```
+```{r}
+### Test Model A2.1 with TESTING data ###
+```
+```{r}
+modela2.1_pred_test <- predict(modela2.1, newdata = select(main12_testdf, -Cpep900), type="response")
+
+modela2.1_predoutcome_test <- ifelse(modela2.1_pred_test <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela2.1_predoutcome_test <- factor(modela2.1_predoutcome_test, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela2.1_tab_test <- table(main12_testdf$Cpep900, modela2.1_predoutcome_test, dnn = c("observed", "predicted"))
+modela2.1_tab_test
+#         predicted
+# observed Low High
+#     Low   73   40
+#     High  29   96
+
+### Accuracy 
+modela2.1_acc_test <- sum(diag(modela2.1_tab_test))/sum(modela2.1_tab_test)
+modela2.1_acc_test ###  0.710084
+
+### Sensitivity and specificity 
+modela2.1_sens_test <-modela2.1_tab_test[2,2]/(modela2.1_tab_test[2,2] + modela2.1_tab_test[2,1])
+modela2.1_spec_test <- modela2.1_tab_test[1,1]/(modela2.1_tab_test[1,1] + modela2.1_tab_test[1,2])
+
+modela2.1_sens_test ###  0.768
+modela2.1_spec_test ###  0.6460177
+
+### PPV and NPV 
+modela2.1_ppv_test <- modela2.1_tab_test[2,2]/(modela2.1_tab_test[2,2] + modela2.1_tab_test[1,2])
+modela2.1_npv_test <- modela2.1_tab_test[1,1]/(modela2.1_tab_test[1,1] + modela2.1_tab_test[2,1])
+
+modela2.1_ppv_test ### 0.7058824
+modela2.1_npv_test ### 0.7156863
+
+### AUC and ROC 
+modela2.1_roc_test <- roc(MAIN5_testlog$Cpep900, modela2.1_pred_test)
+ggroc(modela2.1_roc_test, legacy.axes=TRUE)
+
+modela2.1_roc_test$auc ### 0.7758
+
+### Discrimination slope 
+modela2.1_meanpos <- mean(modela2.1_pred_test[main12_testdf$Cpep900=="High"])
+modela2.1_meanneg <- mean(modela2.1_pred_test[main12_testdf$Cpep900=="Low"])
+modela2.1_discslope <-modela2.1_meanpos - modela2.1_meanneg
+print(modela2.1_discslope) ###0.2507882
+
+### create dataframe for plotting discrimination slope
+df <- data.frame(modela2.1_pred_test, outcome = main12_testdf$Cpep900)
+ggplot(df,aes(x= outcome, y= modela2.1_pred_test, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A2.1",
+       x="Cpep900",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela2.1_pred_test, breaks=quantile(modela2.1_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela2.1_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A2.1")   
+
+### Calibration slope value
+logit_pred <- log(modela2.1_pred_test/(1-modela2.1_pred_test)) ### convert predicted probabilities to log odds
+modela2.1_calib <- glm(Cpep900~logit_pred, family=binomial, data = main12_testdf) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela2.1_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 0.879745529
+```
+```{r}
+### Test Model A4.1 with TESTING data ###
+```
+```{r}
+modela4.1_pred_test <- predict(modela4.1, newdata = select(main12_testdf, -Cpep900), type="response")
+
+modela4.1_predoutcome_test <- ifelse(modela4.1_pred_test <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela4.1_predoutcome_test <- factor(modela4.1_predoutcome_test, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela4.1_tab_test <- table(main12_testdf$Cpep900, modela4.1_predoutcome_test, dnn = c("observed", "predicted"))
+modela4.1_tab_test
+#         predicted
+# observed Low High
+#     Low   71   42
+#     High  39   86
+
+### Accuracy 
+modela4.1_acc_test <- sum(diag(modela4.1_tab_test))/sum(modela4.1_tab_test)
+modela4.1_acc_test ###  0.6596639
+
+### Sensitivity and specificity 
+modela4.1_sens_test <-modela4.1_tab_test[2,2]/(modela4.1_tab_test[2,2] + modela4.1_tab_test[2,1])
+modela4.1_spec_test <- modela4.1_tab_test[1,1]/(modela4.1_tab_test[1,1] + modela4.1_tab_test[1,2])
+
+modela4.1_sens_test ###  0.688
+modela4.1_spec_test ###  0.6283186
+
+### PPV and NPV TESTING data 20
+modela4.1_ppv_test <- modela4.1_tab_test[2,2]/(modela4.1_tab_test[2,2] + modela4.1_tab_test[1,2])
+modela4.1_npv_test <-modela4.1_tab_test[1,1]/(modela4.1_tab_test[1,1] + modela4.1_tab_test[2,1])
+
+modela4.1_ppv_test ### 0.671875
+modela4.1_npv_test ### 0.6454545
+
+### AUC and ROC 
+modela4.1_roc_test <- roc(main12_testdf$Cpep900, modela4.1_pred_test)
+ggroc(modela4.1_roc_test, legacy.axes=TRUE)
+
+modela4.1_roc_test$auc ### 0.7353
+
+### R squared values 
+rsquared <- function(modela4.1) {
+  dev<- modela4.1$deviance
+  null_dev <- modela4.1$null.deviance
+  model_n <- length(modela4.1$fitted.values)
+  R_l <- 1- dev/null_dev
+  R_cs <- 1 - exp(-(null_dev - dev) /model_n)
+  R_n <- R_cs / (1-exp(-(null_dev/model_n)))
+  cat("Pseudo R-squared for logistic regression model\n\n")
+  cat("Hosmes and Lemeshow R-squared\t", round(R_l, 3),"\n")
+  cat("Cox and Snell R-squared\t\t", round(R_cs,3),"\n")
+  cat("Nagelkerke R-dquared\t\t", round(R_n,3), "\n")
+}
+rsquared(modela4.1)
+# Hosmes and Lemeshow R-squared	 0.095 
+# Cox and Snell R-squared		 0.123 
+# Nagelkerke R-dquared		 0.164 
+
+### Discrimination slope and calibration plot 
+modela4.1_meanpos <- mean(modela4.1_pred_test[main12_testdf$Cpep900=="High"])
+modela4.1_meanneg <- mean(modela4.1_pred_test[main12_testdf$Cpep900=="Low"])
+modela4.1_discslope <-modela4.1_meanpos - modela4.1_meanneg
+print(modela4.1_discslope) ###0.1552311
+
+### create dataframe for plotting 
+df <- data.frame(modela4.1_pred_test, outcome = main12_testdf$Cpep900)
+
+### discrimination slope (boxplot)
+ggplot(df,aes(x= outcome, y= modela4.1_pred_test, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A4.1",
+       x="Cpep900",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela4.1_pred_test, breaks=quantile(modela4.1_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela4.1_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A4.1")
+
+### Calibration slope value
+logit_pred <- log(modela4.1_pred_test/(1-modela4.1_pred_test)) ### convert predicted probabilities to log odds
+modela4.1_calib <- glm(Cpep900~logit_pred, family=binomial, data = main12_testdf) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela4.1_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 1.19443500
+```
+
+```{r}
+########## SUBGROUP ANALYSIS (AGE 70 or above) ########## 
+```
+```{r}
+age70 <- main12%>% filter(AgeCpep >69)
+### 518 individuals
+```
+```{r}
+### Subgroup analysis with modela2.1 ###
+```
+```{r}
+modela2.1_pred_age70 <- predict(modela2.1, newdata = select(age70, -Cpep900), type="response")
+
+modela2.1_predoutcome_age70 <- ifelse(modela2.1_pred_age70 <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela2.1_predoutcome_age70 <- factor(modela2.1_predoutcome_age70, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela2.1_tab_age70 <- table(age70$Cpep900, modela2.1_predoutcome_age70, dnn = c("observed", "predicted"))
+modela2.1_tab_age70
+#         predicted
+# observed Low High
+#     Low  161   76
+#     High  62  219
+
+### Accuracy 
+modela2.1_acc_age70 <- sum(diag(modela2.1_tab_age70))/sum(modela2.1_tab_age70)
+modela2.1_acc_age70 ###  0.7335907
+
+### Sensitivity and specificity 
+modela2.1_sens_age70 <- modela2.1_tab_age70[2,2]/(modela2.1_tab_age70[2,2] + modela2.1_tab_age70[2,1])
+modela2.1_spec_age70 <- modela2.1_tab_age70[1,1]/(modela2.1_tab_age70[1,1] + modela2.1_tab_age70[1,2])
+
+modela2.1_sens_age70 ###  0.7793594
+modela2.1_spec_age70 ###  0.6793249
+
+### PPV and NPV 
+modela2.1_ppv_age70 <- modela2.1_tab_age70[2,2]/(modela2.1_tab_age70[2,2] + modela2.1_tab_age70[1,2])
+modela2.1_npv_age70<- modela2.1_tab_age70[1,1]/(modela2.1_tab_age70[1,1] + modela2.1_tab_age70[2,1])
+
+modela2.1_ppv_age70 ### 0.7423729
+modela2.1_npv_age70 ### 0.7219731
+
+### AUC and ROC 
+modela2.1_roc_age70 <- roc(age70$Cpep900, modela2.1_pred_age70)
+ggroc(modela2.1_roc_age70, legacy.axes=TRUE)
+
+modela2.1_roc_age70$auc ### 0.7896
+
+### Discrimination slope and calibration plot 
+modela2.1_meanpos <- mean(modela2.1_pred_age70[age70$Cpep900=="High"])
+modela2.1_meanneg <- mean(modela2.1_pred_age70[age70$Cpep900=="Low"])
+modela2.1_discslope <-modela2.1_meanpos - modela2.1_meanneg
+print(modela2.1_discslope) ###0.259006
+
+### create dataframe for plotting 
+df <- data.frame(modela2.1_pred_age70, outcome = age70$Cpep900)
+
+### discrimination slope (boxplot)
+ggplot(df,aes(x= outcome, y= modela2.1_pred_age70, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A2.1 (Age>=70)",
+       x="Cpep900",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela2.1_pred_age70, breaks=quantile(modela2.1_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela2.1_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A2.1 (Age>=70)")
+
+### Calibration slope value
+logit_pred <- log(modela2.1_pred_age70/(1-modela2.1_pred_age70)) ### convert predicted probabilities to log odds
+modela2.1_calib <- glm(Cpep900~logit_pred, family=binomial, data = age70) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela2.1_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 0.98336664
+```
+```{r}
+### Subgroup analysis with modela4.1 ###
+```
+```{r}
+modela4.1_pred_age70 <- predict(modela4.1, newdata = select(age70, -Cpep900), type="response")
+
+modela4.1_predoutcome_age70 <- ifelse(modela4.1_pred_age70 <0.5, 0, 1) # if probability <0.5, patients is more likely to have low C-peptide
+
+modela4.1_predoutcome_age70 <- factor(modela4.1_predoutcome_age70, levels = c(0,1), labels = c("Low", "High")) # transform predictions into factor and set labels
+
+### compare observed and predicted outcomes 
+modela4.1_tab_age70 <- table(age70$Cpep900, modela4.1_predoutcome_age70, dnn = c("observed", "predicted"))
+modela4.1_tab_age70
+#         predicted
+# observed Low High
+#     Low  159   78
+#     High 105  176
+
+
+### Accuracy 
+modela4.1_acc_age70 <- sum(diag(modela4.1_tab_age70))/sum(modela4.1_tab_age70)
+modela4.1_acc_age70 ###  0.6467181
+
+### Sensitivity and specificity
+modela4.1_sens_age70 <- modela4.1_tab_age70[2,2]/(modela4.1_tab_age70[2,2] + modela4.1_tab_age70[2,1])
+modela4.1_spec_age70 <- modela4.1_tab_age70[1,1]/(modela4.1_tab_age70[1,1] + modela4.1_tab_age70[1,2])
+
+modela4.1_sens_age70 ###  0.6263345
+modela4.1_spec_age70 ###  0.6708861
+
+### PPV and NPV 
+modela4.1_ppv_age70 <- modela4.1_tab_age70[2,2]/(modela4.1_tab_age70[2,2] + modela4.1_tab_age70[1,2])
+modela4.1_npv_age70<- modela4.1_tab_age70[1,1]/(modela4.1_tab_age70[1,1] + modela4.1_tab_age70[2,1])
+
+modela4.1_ppv_age70 ### 0.6929134
+modela4.1_npv_age70 ### 0.6022727
+
+### AUC and ROC
+modela4.1_roc_age70 <- roc(age70$Cpep900, modela4.1_pred_age70)
+ggroc(modela4.1_roc_age70, legacy.axes=TRUE)
+
+modela4.1_roc_age70$auc ### 0.7263
+
+### Discrimination slope and calibration plot 
+modela4.1_meanpos <- mean(modela4.1_pred_age70[age70$Cpep900=="High"])
+modela4.1_meanneg <- mean(modela4.1_pred_age70[age70$Cpep900=="Low"])
+modela4.1_discslope <-modela4.1_meanpos - modela4.1_meanneg
+print(modela4.1_discslope) ###0.1375968
+
+### create dataframe for plotting 
+df <- data.frame(modela4.1_pred_age70, outcome = age70$Cpep900)
+
+### discrimination slope (boxplot)
+ggplot(df,aes(x= outcome, y= modela4.1_pred_age70, fill=outcome))+
+  geom_boxplot(fill=NA)+
+  labs(title="Model A4.1 (Age>=70)",
+       x="Cpep900",
+       y="Predicted probability") +
+  stat_summary(fun=mean, geom = "point", shape=23, size=4, color="red", fill="white")+
+  theme_minimal()
+
+### calibration plot
+df$outcome <- as.numeric(df$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df <- df %>%
+  mutate(decile=cut(modela4.1_pred_age70, breaks=quantile(modela4.1_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela4.1_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed") + ggtitle("Model A4.1 (Age>=70)")
+
+### Calibration slope value
+logit_pred <- log(modela4.1_pred_age70/(1-modela4.1_pred_age70)) ### convert predicted probabilities to log odds
+modela4.1_calib <- glm(Cpep900~logit_pred, family=binomial, data = age70) ### fit logistic regression to calculate calibration slope
+
+calibration_slope <- coef(modela4.1_calib)### calibration slope is the coefficent of logit_model
+print(calibration_slope) ### 1.2610330
+```
+
+
+######################################################################################################
+######################################################################################################
+
+```{r}
+####### MANUSCRIPT TABLE AND FIGURES #######
+```
+```{r}
+### Table 1 ###
+```
+```{r}
+library(compareGroups)
+### Descriptive table for the whole cohort (n=1191) ### 
+main12_sub <- main12[,c("sex", "cpep_pmol", "AgeCpep","Calculated_BMI", "DiabDuration", "TimeToInsulin", "NewHbA1C2","NewALT2", "NewHDL", "NewTG", "Creatinine", "OnSU", "BasalBolus")]
+table1 <-descrTable(main12_sub,method = c(cpep_pmol=NA, AgeCpep=NA, Calculated_BMI=NA, DiabDuration=NA, TimeToInsulin=NA, NewHbA1C2=NA, NewALT2=NA, NewHDL=NA, NewTG=NA, Creatinine=NA))
+print(table1)
+export2word(table1, file = "table1.docx")
+
+### Descriptive table stratified by C-peptide high or low (C-peptide 600pmol/L) ###
+table2 <- descrTable(Cpep600~ cpep_pmol + sex+ AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewHbA1C2 + NewALT2 + NewHDL + NewTG + Creatinine + OnSU + BasalBolus, data=MAIN5_sub, method = c(cpep_pmol=NA, AgeCpep=NA, Calculated_BMI=NA, DiabDuration=NA, TimeToInsulin=NA, NewHbA1C2=NA, NewALT2=NA, NewHDL=NA, NewTG=NA, Creatinine=NA))
+print(table2)
+export2word(table2, file = "Descriptive_600_Manuscript.docx")
+
+### Descriptive table stratified by C-peptide high or low (C-peptide 900pmol/L) ###
+table3 <- descrTable(Cpep900~ cpep_pmol + sex+ AgeCpep + Calculated_BMI + DiabDuration + TimeToInsulin + NewHbA1C2 + NewALT2 + NewHDL + NewTG + Creatinine + OnSU + BasalBolus, data=MAIN5_sub, method = c(cpep_pmol=NA,AgeCpep=NA, Calculated_BMI=NA, DiabDuration=NA, TimeToInsulin=NA, NewHbA1C2=NA, NewALT2=NA, NewHDL=NA, NewTG=NA, Creatinine=NA))
+print(table3)
+export2word(table3, file = "Descriptive_900_Manuscript.docx")
+```
+
+```{r}
+### Figure 2 ###
+# INTERNAL VALIDATION AUROC with confidence intervals between modela3.5 (full model) and model5.1 (basic model) #
+```
+```{r}
+roc_a3.5 <- roc(main12_testlog$Cpep600, modela3.5_pred_test)
+roc_a5.1 <- roc(main12_testlog$Cpep600, modela5.1_pred_test)
+
+ci_a3.5 <- ci.auc(roc_a3.5) ## 95% CI modela3.5
+ci_a5.1 <- ci.auc(roc_a5.1) ## 95% CI modela5.1
+
+print(ci_a3.5) # 95% CI: 0.8169-0.9177 (DeLong)
+print(ci_a5.1) # 95% CI: 0.7117-0.846 (DeLong)
+
+auc_a3.5 <-auc(roc_a3.5)
+print(auc_a3.5) #0.8673
+
+df_auc <- data.frame(
+  Model=c("Full model", "Basic model"),
+  AUC = c(ci_a3.5[2], ci_a5.1[2]),
+  lower = c(ci_a3.5[1], ci_a5.1[1]),
+  upper = c(ci_a3.5[3], ci_a5.1[3])
+)
+
+ggplot(df_auc, aes(x= Model, y = AUC))+
+  geom_point(size=4, color = "#7883BA")+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width=0.2, color = "#7883BA")+
+  ylim(0.6, 1.0)+
+  theme_bw()
+ggsave("auc_plot_Cpep600.png", width=5, height=5, dpi=300)
+```
+
+```{r}
+### Figure 3 ###
+# INTERNAL VALIDATION Calibration plot for modela3.5 (full model) (Figure 3C) and model5.1 (basic model) Figure 3A)
+```
+```{r}
+df2 <- data.frame(modela3.5_pred_test, outcome = main12_testlog$Cpep600)
+df2$outcome <- as.numeric(df2$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df2 <- df2 %>%
+  mutate(decile=cut(modela3.5_pred_test, breaks=quantile(modela3.5_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela3.5_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df2, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_fullmodel1.png",width=5, height=5,dpi=300)
+
+
+df3 <- data.frame(modela5.1_pred_test, outcome = main12_testlog$Cpep600)
+df3$outcome <- as.numeric(df3$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df3 <- df3 %>%
+  mutate(decile=cut(modela5.1_pred_test, breaks=quantile(modela5.1_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela5.1_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df3, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_basicmodel1.png", width=5, height=5,dpi=300)
+```
+
+
+```{r}
+### ESM Figure 3###
+# Forest plot for Odds ratio of variables in full model using C-peptide threshold 600pmol/L# 
+```
+```{r}
+### (coefficients in logistic regression represent log odds. To obtain IR, need to exponentiate coefficients)
+## step 1: extract coefficients and CI
+OR <- exp(coef(modela3.5)) # exponentiate coefficients to get ORs
+CI <- exp(confint(modela3.5))
+pvalue <- summary(modela3.5)$coefficients[,4]
+
+## step 2: create data frame for forest plot
+OR_df <- data.frame (
+  Variable = names(OR)[-1], # exclude intercept
+  OR = OR[-1], #exclude intercept
+  LowerCI = CI[-1, 1],
+  UpperCI = CI[-1,2],
+  Pvalue = pvalue[-1]
+)
+print(OR_df)
+
+OR_df[1, "Variable"] <- "Female"
+OR_df[2, "Variable"] <- "BMI"
+OR_df[3, "Variable"] <- "Diabetes duration"
+OR_df[4, "Variable"] <- "Time to insulin"
+OR_df[5, "Variable"] <- "HDL-cholesterol"
+OR_df[6, "Variable"] <- "Non-basal-bolus insulin regime"
+OR_df[7, "Variable"] <- "HbA1c"
+OR_df[8, "Variable"] <- "Creatinine"
+OR_df[9, "Variable"] <- "Triglycerides"
+
+## step 3: generate forest plot
+ggplot (OR_df, aes(x= Variable, y=OR, ymin=LowerCI, ymax=UpperCI))+
+  geom_pointrange() + # plot points with CI bars
+  geom_hline(yintercept =1, linetype = "dashed")+ # reference line at OR=1
+  coord_flip() + #flip for better readibility
+  xlab("Predictors")+
+  ylab("Odds Ratio (95% CI)")+
+  theme_minimal()
+
+
+png("Full model cpep600.png", width = 1500, height=1000, res=300) # save as png image
+ggplot(OR_df, aes(y=Variable, x=OR))+
+  geom_point(color="#C04140", size=1.25)+ #point for HR
+  geom_errorbarh(aes(xmin=LowerCI, xmax=UpperCI), height = 0.2, color ="#7883BA")+ #error bars
+  labs(title = "C-peptide outcomes defined by 600pmol/L", x="Odds ratio", y="Predictors")+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title.x =element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text = element_text(size=6))+
+  geom_vline(xintercept =1, linetype="dotted", color="black")+
+  geom_text(
+    aes(label = sprintf("%.2f(%.2f-%.2f)", OR, LowerCI, UpperCI)),
+    hjust = -0.05,
+    vjust = 1.5, # display OR and CI slightly below error bars
+    color = "black",
+    size =2 )
+
+dev.off()
+  
+```
+
+```{r}
+### ESM Figure 4 ### 
+# Primary analysis 5 fold CV and Bootstrapping ROC cuves #
+```
+```{r}
+probs_kfcv <- modela3.5_kfcv$pred$High
+labels_kfcv <- modela3.5_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.81","\n",
+             "(95% CI: 0.77-0.85)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Full_KFCV.png", width = 7, height=6, dpi=300)
+
+probs_kfcv <- modela5.1_kfcv$pred$High
+labels_kfcv <- modela5.1_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.73","\n",
+             "(95% CI: 0.68-0.77)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Basic_KFCV.png", width = 7, height=6, dpi=300)
+
+probs_boot <- modela3.5_boot$pred$High
+labels_boot <- modela3.5_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.81","\n",
+             "(95% CI: 0.80-0.86)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Full_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+
+probs_boot <- modela5.1_boot$pred$High
+labels_boot <- modela5.1_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 600pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.73","\n",
+             "(95% CI: 0.70-0.77)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_600_Basic_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+```
+
+```{r}
+### ESM Figure 5 ###
+# INTERNAL VALIDATION Discrimination plot between modela3.5 (full model) and model5.1 (basic model) #
+```
+```{r}
+df <- data.frame( 
+  outcome = main12_testlog$Cpep600, 
+  Basic = modela5.1_pred_test, 
+  Full = modela3.5_pred_test) %>%
+  pivot_longer(cols = c(Basic, Full),
+               names_to = "model",
+               values_to = "predicted_prob")
+
+ggplot(df,aes(x= outcome, y= predicted_prob, fill= model))+
+  geom_violin(trim=F, alpha = 0.6, color = NA) +
+  stat_summary (fun = mean, geom = "crossbar", width = 0.5, color = "black", position = position_dodge (width=0.9), linetype = "dashed", size = 0.1)+
+  scale_fill_manual(values = c("Basic" = "#CADAE8", "Full"= "#8AA9D6"))+
+  labs(x="Observed C-peptide level",
+       y="Predicted probability",
+       fill = "Model") +
+  theme_bw()
+ggsave("discrimination_plot1.png",width=5, height=5, dpi=300)
+
+df <- data.frame( 
+  outcome = main12_testdf$Cpep900, 
+  Basic = modela4.1_pred_test, 
+  Full = modela2.1_pred_test) %>%
+  pivot_longer(cols = c(Basic, Full),
+               names_to = "model",
+               values_to = "predicted_prob")
+
+ggplot(df,aes(x= outcome, y= predicted_prob, fill= model))+
+  geom_violin(trim=F, alpha = 0.6, color = NA) +
+  stat_summary (fun = mean, geom = "crossbar", width = 0.5, color = "black", position = position_dodge (width=0.9), linetype = "dashed", size = 0.1)+
+  scale_fill_manual(values = c("Basic" = "#CADAE8", "Full"= "#8AA9D6"))+
+  labs(x="Observed C-peptide level",
+       y="Predicted probability",
+       fill = "Model") +
+  theme_bw()
+ggsave("discrimination_plot2.png", width=5, height=5, dpi=300)
+```
+
+```{r}
+### ESM Figure 6 ###
+# Forest plot for Odds ratio of variables in full model using C-peptide threshold 900pmol/L# 
+```
+```{r}
+### Forest plot for Odds ratio (coefficients in logistic regression represent log odds. To obtain OR, need to exponentiate coefficients)
+## step 1: extract coefficients and CI
+OR <- exp(coef(modela2.1)) # exponentiate coefficients to get ORs
+CI <- exp(confint(modela2.1))
+pvalue <- summary(modela2.1)$coefficients[,4]
+
+## step 2: create data frame for forest plot
+OR_df <- data.frame (
+  Variable = names(OR)[-1], # exclude intercept
+  OR = OR[-1], #exclude intercept
+  LowerCI = CI[-1, 1],
+  UpperCI = CI[-1,2],
+  Pvalue = pvalue[-1]
+)
+print(OR_df)
+
+OR_df[1, "Variable"] <- "Female"
+OR_df[2, "Variable"] <- "Age"
+OR_df[3, "Variable"] <- "BMI"
+OR_df[4, "Variable"] <- "Diabetes duration"
+OR_df[5, "Variable"] <- "Time to insulin"
+OR_df[6, "Variable"] <- "ALT"
+OR_df[7, "Variable"] <- "HDL-cholesterol"
+OR_df[8, "Variable"] <- "Sulphonylurea use"
+OR_df[9, "Variable"] <- "Non-basal-bolus insulin regime"
+OR_df[10, "Variable"] <- "HbA1c"
+OR_df[11, "Variable"] <- "Creatinine"
+OR_df[12, "Variable"] <- "Triglycerides"
+
+## step 3: generate forest plot
+ggplot (OR_df, aes(x= Variable, y=OR, ymin=LowerCI, ymax=UpperCI))+
+  geom_pointrange() + # plot points with CI bars
+  geom_hline(yintercept =1, linetype = "dashed")+ # reference line at OR=1
+  coord_flip() + #flip for better readibility
+  xlab("Predictors")+
+  ylab("Odds Ratio (95% CI)")+
+  theme_minimal()
+
+
+png("Full model cpep900.png", width = 1500, height=1000, res=300) # save as png image
+ggplot(OR_df, aes(y=Variable, x=OR))+
+  geom_point(color="#C04140", size=1.25)+ #point for HR
+  geom_errorbarh(aes(xmin=LowerCI, xmax=UpperCI), height = 0.2, color ="#7883BA")+ #error bars
+  labs(title = "C-peptide outcomes defined by 900pmol/L", x="Odds ratio", y="Predictors")+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title.x =element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text = element_text(size=6))+
+  geom_vline(xintercept =1, linetype="dotted", color="black")+
+  geom_text(
+    aes(label = sprintf("%.2f(%.2f-%.2f)", OR, LowerCI, UpperCI)),
+    hjust = -0.05,
+    vjust = 1.5, # display OR and CI slightly below error bars
+    color = "black",
+    size =2 )
+
+dev.off()
+  
+```
+
+```{r}
+### ESM Figure 7 ###
+# INTERNAL VALIDATION AUROC with confidence intervals between modelaa2.1 (full model) and model4.1 (basic model) #
+```
+```{r}
+roc_a2.1 <- roc(main12_testdf$Cpep900, modela2.1_pred_test)
+roc_a4.1 <- roc(main12_testdf$Cpep900, modela4.1_pred_test)
+
+ci_a2.1 <- ci.auc(roc_a2.1) ## 95% CI modela2.1
+ci_a4.1<- ci.auc(roc_a4.1) ## 95% CI modela4.1
+
+print(ci_a2.1) # 0.7174-0.8342 (DeLong)
+print(ci_a4.1) # 0.6727-0.7979 (DeLong)
+
+df_auc <- data.frame(
+  Model=c("Full model", "Basic model"),
+  AUC = c(ci_a2.1[2], ci_a4.1[2]),
+  lower = c(ci_a2.1[1], ci_a4.1[1]),
+  upper = c(ci_a2.1[3], ci_a4.1[3])
+)
+
+ggplot(df_auc, aes(x= Model, y = AUC))+
+  geom_point(size=4, color = "#7883BA")+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width=0.2, color = "#7883BA")+
+  ylim(0.6, 1.0)+
+  theme_bw()
+ggsave("auc_plot_Cpep900.png", width=5, height=5, dpi=300)
+```
+
+```{r}
+### ESM Figure 8 ###
+# Secondary analysis 5 fold CV and Bootstrapping ROC cuves #
+```
+```{r}
+probs_kfcv <- modela2.1_kfcv$pred$High
+labels_kfcv <- modela2.1_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.77","\n",
+             "(95% CI: 0.72-0.84)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_KFCV.png", width = 7, height=6, dpi=300)
+
+probs_kfcv <- modela4.1_kfcv$pred$High
+labels_kfcv <- modela4.1_kfcv$pred$obs
+roc_kfcv <- roc(labels_kfcv, probs_kfcv, ci=TRUE)
+
+roc_df_kfcv <- data.frame(
+  fpr=1-roc_kfcv$specificities,
+  tpr=roc_kfcv$sensitivities
+)
+
+ggplot(roc_df_kfcv, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.69","\n",
+             "(95% CI: 0.62-0.74)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_Basic_KFCV.png", width = 7, height=6, dpi=300)
+
+probs_boot <- modela2.1_boot$pred$High
+labels_boot <- modela2.1_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.77","\n",
+             "(95% CI: 0.77-0.82)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+
+probs_boot <- modela4.1_boot$pred$High
+labels_boot <- modela4.1_boot$pred$obs
+roc_boot <- roc(labels_boot, probs_boot, ci=TRUE)
+
+roc_df_boot <- data.frame(
+  fpr=1-roc_boot$specificities,
+  tpr=roc_boot$sensitivities
+)
+
+ggplot(roc_df_boot, aes(x=fpr, y=tpr))+
+  geom_line(color="#7883BA", size=1)+
+  geom_abline(linetype="dashed", color="gray")+
+  labs(title="C-peptide defined by 900pmol/L",
+       x="False positive rate",
+       y= "True positive rate")+
+  theme_minimal()+
+  annotate("text", x=0.7, y=0.05, #adjust as needed for position of text
+           label=paste0(
+             "AUC = 0.69","\n",
+             "(95% CI: 0.66-0.73)"
+           ),
+           hjust=0, vjust=0, size=5, color="black")
+ggsave("ROC_900_Basic_BOOTSTRAP.png", width = 7, height=6, dpi=300)
+```
+
+```{r}
+### ESM Figure 9 ###
+# INTERNAL VALIDATION Calibration plot for modela2.1 (full model) (Figure 9C) and model4.1 (basic model) Figure 9A)
+```
+```{r}
+df2 <- data.frame(modela2.1_pred_test, outcome = main12_testdf$Cpep900)
+df2$outcome <- as.numeric(df2$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df2 <- df2 %>%
+  mutate(decile=cut(modela2.1_pred_test, breaks=quantile(modela2.1_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela2.1_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df2, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_fullmodel2.png",width=5, height=5, dpi=300)
+
+
+df3 <- data.frame(modela4.1_pred_test, outcome = main12_testdf$Cpep900)
+df3$outcome <- as.numeric(df3$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df3 <- df3 %>%
+  mutate(decile=cut(modela4.1_pred_test, breaks=quantile(modela4.1_pred_test, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela4.1_pred_test),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df3, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_basicmodel2.png", width=5, height=5,dpi=300)
+```
+
+```{r}
+### ESM Figure 10 ###
+# INTERNAL VALIDATION AUROC with confidence intervals for Subgroup analysis in age 70 or above #
+```
+```{r}
+roc_a3.5 <- roc(age70$Cpep600, modela3.5_pred_age70)
+roc_a5.1 <- roc(age70$Cpep600, modela5.1_pred_age70)
+
+ci_a3.5 <- ci.auc(roc_a3.5) ## 95% CI modela3.5
+ci_a5.1 <- ci.auc(roc_a5.1) ## 95% CI modela5.1
+
+print(ci_a3.5) # 95% CI: 0.8031-0.8786 (DeLong)
+print(ci_a5.1) # 95% CI: 0.703-0.8027 (DeLong)
+
+auc_a3.5 <-auc(roc_a3.5)
+print(auc_a3.5) #0.8409
+
+df_auc <- data.frame(
+  Model=c("Full model", "Basic model"),
+  AUC = c(ci_a3.5[2], ci_a5.1[2]),
+  lower = c(ci_a3.5[1], ci_a5.1[1]),
+  upper = c(ci_a3.5[3], ci_a5.1[3])
+)
+
+ggplot(df_auc, aes(x= Model, y = AUC))+
+  geom_point(size=4, color = "#7883BA")+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width=0.2, color = "#7883BA")+
+  ylim(0.6, 1.0)+
+  theme_bw()
+ggsave("auc_plot_cpep600_age70.png", width=5, height=5, dpi=300)
+
+
+roc_a2.1 <- roc(age70$Cpep900, modela2.1_pred_age70)
+roc_a4.1 <- roc(age70$Cpep900, modela4.1_pred_age70)
+
+ci_a2.1 <- ci.auc(roc_a2.1) ## 95% CI modela3.5
+ci_a4.1 <- ci.auc(roc_a4.1) ## 95% CI modela5.1
+
+print(ci_a2.1) # 95% CI: 0.7509-0.8283  (DeLong)
+print(ci_a4.1) # 95% CI: 0.6828-0.7698  (DeLong)
+
+auc_a2.1 <-auc(roc_a2.1)
+print(auc_a2.1) #0.7896
+
+df_auc <- data.frame(
+  Model=c("Full model", "Basic model"),
+  AUC = c(ci_a2.1[2], ci_a4.1[2]),
+  lower = c(ci_a2.1[1], ci_a4.1[1]),
+  upper = c(ci_a2.1[3], ci_a4.1[3])
+)
+
+ggplot(df_auc, aes(x= Model, y = AUC))+
+  geom_point(size=4, color = "#7883BA")+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width=0.2, color = "#7883BA")+
+  ylim(0.6, 1.0)+
+  theme_bw()
+ggsave("auc_plot_cpep900_age70.png", width=5, height=5, dpi=300)
+```
+
+```{r}
+### ESM Figure 11 ###
+# Subgroup analysis calibration plot for modela3.5 (full model) (Figure 11C) and model5.1 (basic model) (Figure 11A); modela2.1 (full model) (Figure 11D) and model 4.1 (basic model) (Figure 11B)
+```
+```{r}
+df2 <- data.frame(modela3.5_pred_age70, outcome = age70$Cpep600)
+df2$outcome <- as.numeric(df2$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df2 <- df2 %>%
+  mutate(decile=cut(modela3.5_pred_age70, breaks=quantile(modela3.5_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela3.5_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df2, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_fullmodel_Cpep600_age70.png",width=5, height=5,dpi=300)
+
+
+df3 <- data.frame(modela5.1_pred_age70, outcome = age70$Cpep600)
+df3$outcome <- as.numeric(df3$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df3 <- df3 %>%
+  mutate(decile=cut(modela5.1_pred_age70, breaks=quantile(modela5.1_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela5.1_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df3, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_basicmodel_Cpep600_age70.png", width=5, height=5,dpi=300)
+
+
+df2 <- data.frame(modela2.1_pred_age70, outcome = age70$Cpep900)
+df2$outcome <- as.numeric(df2$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df2 <- df2 %>%
+  mutate(decile=cut(modela2.1_pred_age70, breaks=quantile(modela2.1_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela2.1_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df2, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_fullmodel_Cpep900_age70.png",width=5, height=5,dpi=300)
+
+
+df3 <- data.frame(modela4.1_pred_age70, outcome = age70$Cpep900)
+df3$outcome <- as.numeric(df3$outcome)-1 ### convert outcome from factor to numeric so that can calculate mean
+
+df3 <- df3 %>%
+  mutate(decile=cut(modela4.1_pred_age70, breaks=quantile(modela4.1_pred_age70, probs = 0:10/10), include.lowest = TRUE, labels=FALSE))%>%   group_by(decile) %>% summarise(mean_predicted = mean(modela4.1_pred_age70),
+                                 mean_observed = mean(outcome),
+                                 count=n(),
+                                 se= sqrt(mean_observed*(1-mean_observed)/count),
+                                 ci_lower=mean_observed - 1.96*se,
+                                 ci_upper= mean_observed + 1.96*se)
+
+ggplot(df3, aes(x=mean_predicted, y=mean_observed))+
+  geom_point(shape=21, size=2)+
+  geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.02, color="#8AA9D6", size=0.8) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme_bw()+
+  scale_x_continuous(breaks= seq (0,1,0.1))+
+  scale_y_continuous(breaks = seq(0,1,0.1))+
+  xlab("Predicted probability") + ylab("Observed")  
+ggsave("calibration_basicmodel_Cpep900_age70.png", width=5, height=5,dpi=300)
+```
